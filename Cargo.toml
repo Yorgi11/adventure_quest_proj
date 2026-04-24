@@ -7,6 +7,9 @@ members = [
     "crates/world",
     "crates/terrain",
     "crates/meshing",
+    "crates/physics",
+    "crates/gameplay",
+    "crates/renderer",
 ]
 
 [workspace.package]
@@ -21,3 +24,11 @@ voxels = { path = "crates/voxels" }
 world = { path = "crates/world" }
 terrain = { path = "crates/terrain" }
 meshing = { path = "crates/meshing" }
+physics = { path = "crates/physics" }
+gameplay = { path = "crates/gameplay" }
+renderer = { path = "crates/renderer" }
+winit = { version = "0.30.13", features = ["rwh_06"] }
+wgpu = "29.0.1"
+pollster = "0.4.0"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+glam = "0.30.9"

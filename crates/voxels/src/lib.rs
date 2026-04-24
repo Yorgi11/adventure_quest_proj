@@ -6,6 +6,8 @@ pub const AIR_BLOCK: BlockId = 0;
 pub const DIRT_BLOCK: BlockId = 1;
 pub const GRASS_BLOCK: BlockId = 2;
 pub const STONE_BLOCK: BlockId = 3;
+pub const COAL_ORE_BLOCK: BlockId = 4;
+pub const IRON_ORE_BLOCK: BlockId = 5;
 
 pub const CHUNK_SIZE: usize = 32;
 pub const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
@@ -97,7 +99,7 @@ impl Chunk {
         self.blocks[index] = block;
     }
 
-    pub fn set_block(&mut self, x: usize, y: usize, z: usize, new_block: BlockId) {
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, new_block: BlockId) -> bool {
         debug_assert!(x < CHUNK_SIZE);
         debug_assert!(y < CHUNK_SIZE);
         debug_assert!(z < CHUNK_SIZE);
@@ -106,7 +108,7 @@ impl Chunk {
         let old_block = self.blocks[index];
 
         if old_block == new_block {
-            return;
+            return false;
         }
 
         let old_is_air = old_block == AIR_BLOCK;
@@ -142,6 +144,7 @@ impl Chunk {
 
         self.mark_subchunk_dirty(sub);
         self.revision = self.revision.wrapping_add(1);
+        true
     }
 
     #[inline(always)]
@@ -187,7 +190,7 @@ mod tests {
     fn setting_block_updates_masks() {
         let mut chunk = Chunk::new_empty(ChunkCoord::new(0, 0, 0));
 
-        chunk.set_block(0, 0, 0, STONE_BLOCK);
+        assert!(chunk.set_block(0, 0, 0, STONE_BLOCK));
 
         assert_eq!(chunk.solid_block_count, 1);
         assert_eq!(chunk.subchunk_solid_counts[0], 1);
@@ -201,11 +204,22 @@ mod tests {
         let mut chunk = Chunk::new_empty(ChunkCoord::new(0, 0, 0));
 
         chunk.set_block(0, 0, 0, STONE_BLOCK);
-        chunk.set_block(0, 0, 0, AIR_BLOCK);
+        assert!(chunk.set_block(0, 0, 0, AIR_BLOCK));
 
         assert_eq!(chunk.solid_block_count, 0);
         assert_eq!(chunk.subchunk_solid_counts[0], 0);
         assert_eq!(chunk.subchunk_occupancy_mask, 0);
         assert_eq!(chunk.revision, 2);
+    }
+
+    #[test]
+    fn setting_same_block_reports_no_change() {
+        let mut chunk = Chunk::new_empty(ChunkCoord::new(0, 0, 0));
+
+        assert!(!chunk.set_block(0, 0, 0, AIR_BLOCK));
+
+        assert_eq!(chunk.solid_block_count, 0);
+        assert_eq!(chunk.subchunk_dirty_mask, 0);
+        assert_eq!(chunk.revision, 0);
     }
 }

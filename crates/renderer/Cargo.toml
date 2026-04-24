@@ -1,17 +1,15 @@
 [package]
-name = "client"
+name = "renderer"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 foundation.workspace = true
-voxels.workspace = true
-world.workspace = true
+glam.workspace = true
 meshing.workspace = true
-physics.workspace = true
-gameplay.workspace = true
-renderer.workspace = true
+voxels.workspace = true
+wgpu.workspace = true
 winit.workspace = true
-pollster.workspace = true

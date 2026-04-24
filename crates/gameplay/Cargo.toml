@@ -1,5 +1,5 @@
 [package]
-name = "client"
+name = "gameplay"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
@@ -7,11 +7,6 @@ license.workspace = true
 
 [dependencies]
 foundation.workspace = true
+physics.workspace = true
 voxels.workspace = true
 world.workspace = true
-meshing.workspace = true
-physics.workspace = true
-gameplay.workspace = true
-renderer.workspace = true
-winit.workspace = true
-pollster.workspace = true
