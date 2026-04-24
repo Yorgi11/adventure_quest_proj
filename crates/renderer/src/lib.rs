@@ -34,6 +34,8 @@ pub struct VoxelRenderer {
     overlay_vertex_buffer: Option<wgpu::Buffer>,
     overlay_vertex_count: u32,
     chunk_meshes: Vec<GpuChunkMesh>,
+    frustum_culling_enabled: bool,
+    last_frame_stats: RenderFrameStats,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +53,14 @@ pub struct ChunkMeshInfo {
     pub index_count: u32,
     pub visible_mask: u8,
     pub bounds: Aabb,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RenderFrameStats {
+    pub uploaded_chunk_meshes: usize,
+    pub drawn_chunk_meshes: usize,
+    pub culled_chunk_meshes: usize,
+    pub drawn_indices: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,6 +107,10 @@ impl VoxelCamera {
     pub fn rotate(&mut self, yaw_delta: f32, pitch_delta: f32) {
         self.yaw_radians += yaw_delta;
         self.pitch_radians = (self.pitch_radians + pitch_delta).clamp(-1.45, 1.45);
+    }
+
+    pub fn forward_direction(self) -> [f32; 3] {
+        self.forward_vector().to_array()
     }
 
     fn view_projection(self, aspect: f32) -> Mat4 {
@@ -211,7 +225,7 @@ impl VoxelRenderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
+                cull_mode: Some(wgpu::Face::Back),
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
@@ -300,6 +314,8 @@ impl VoxelRenderer {
             overlay_vertex_buffer: None,
             overlay_vertex_count: 0,
             chunk_meshes: Vec::new(),
+            frustum_culling_enabled: true,
+            last_frame_stats: RenderFrameStats::default(),
         })
     }
 
@@ -389,6 +405,18 @@ impl VoxelRenderer {
         self.chunk_meshes.iter().map(GpuChunkMesh::info)
     }
 
+    pub const fn last_frame_stats(&self) -> RenderFrameStats {
+        self.last_frame_stats
+    }
+
+    pub const fn frustum_culling_enabled(&self) -> bool {
+        self.frustum_culling_enabled
+    }
+
+    pub fn set_frustum_culling_enabled(&mut self, enabled: bool) {
+        self.frustum_culling_enabled = enabled;
+    }
+
     pub fn set_fps_overlay(&mut self, fps: Option<u32>) {
         let text = fps.map(|fps| format!("FPS {fps}"));
         self.set_overlay_text(text);
@@ -465,6 +493,8 @@ impl VoxelRenderer {
     }
 
     pub fn render(&mut self) -> RenderFrameStatus {
+        self.last_frame_stats = RenderFrameStats::default();
+
         if self.size.width == 0 || self.size.height == 0 {
             return RenderFrameStatus::Skipped;
         }
@@ -490,6 +520,14 @@ impl VoxelRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Adventure Quest Frame Encoder"),
             });
+        let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
+        let frustum = self
+            .frustum_culling_enabled
+            .then(|| CameraFrustum::from_camera(self.camera, aspect));
+        let mut stats = RenderFrameStats {
+            uploaded_chunk_meshes: self.chunk_meshes.len(),
+            ..RenderFrameStats::default()
+        };
 
         {
             let color_attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -523,10 +561,21 @@ impl VoxelRenderer {
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
                 for mesh in &self.chunk_meshes {
+                    if frustum
+                        .as_ref()
+                        .is_some_and(|frustum| !frustum.intersects_aabb(mesh.bounds))
+                    {
+                        stats.culled_chunk_meshes += 1;
+                        continue;
+                    }
+
                     render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+
+                    stats.drawn_chunk_meshes += 1;
+                    stats.drawn_indices += mesh.index_count;
                 }
             }
 
@@ -539,6 +588,7 @@ impl VoxelRenderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        self.last_frame_stats = stats;
 
         RenderFrameStatus::Rendered
     }
@@ -646,6 +696,99 @@ fn chunk_bounds(coord: ChunkCoord) -> Aabb {
     let max = [min[0] + size, min[1] + size, min[2] + size];
 
     Aabb::new(min, max)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CameraFrustum {
+    planes: [Plane; 6],
+}
+
+impl CameraFrustum {
+    fn from_camera(camera: VoxelCamera, aspect: f32) -> Self {
+        let position = Vec3::from_array(camera.position);
+        let forward = camera.forward_vector();
+        let world_up = if forward.dot(Vec3::Y).abs() > 0.98 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        let right = forward.cross(world_up).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let half_vertical = camera.fov_y_radians * 0.5;
+        let half_horizontal = (half_vertical.tan() * aspect.max(0.001)).atan();
+        let sin_vertical = half_vertical.sin();
+        let cos_vertical = half_vertical.cos();
+        let sin_horizontal = half_horizontal.sin();
+        let cos_horizontal = half_horizontal.cos();
+
+        Self {
+            planes: [
+                Plane::from_point_normal(position + forward * camera.near, forward),
+                Plane::from_point_normal(position + forward * camera.far, -forward),
+                Plane::from_point_normal(
+                    position,
+                    (forward * sin_horizontal + right * cos_horizontal).normalize_or_zero(),
+                ),
+                Plane::from_point_normal(
+                    position,
+                    (forward * sin_horizontal - right * cos_horizontal).normalize_or_zero(),
+                ),
+                Plane::from_point_normal(
+                    position,
+                    (forward * sin_vertical + up * cos_vertical).normalize_or_zero(),
+                ),
+                Plane::from_point_normal(
+                    position,
+                    (forward * sin_vertical - up * cos_vertical).normalize_or_zero(),
+                ),
+            ],
+        }
+    }
+
+    fn intersects_aabb(self, bounds: Aabb) -> bool {
+        self.planes
+            .iter()
+            .all(|plane| plane.distance(aabb_positive_vertex(bounds, plane.normal)) >= 0.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Plane {
+    normal: Vec3,
+    distance_from_origin: f32,
+}
+
+impl Plane {
+    fn from_point_normal(point: Vec3, normal: Vec3) -> Self {
+        Self {
+            normal,
+            distance_from_origin: -normal.dot(point),
+        }
+    }
+
+    fn distance(self, point: Vec3) -> f32 {
+        self.normal.dot(point) + self.distance_from_origin
+    }
+}
+
+fn aabb_positive_vertex(bounds: Aabb, normal: Vec3) -> Vec3 {
+    Vec3::new(
+        if normal.x >= 0.0 {
+            bounds.max[0]
+        } else {
+            bounds.min[0]
+        },
+        if normal.y >= 0.0 {
+            bounds.max[1]
+        } else {
+            bounds.min[1]
+        },
+        if normal.z >= 0.0 {
+            bounds.max[2]
+        } else {
+            bounds.min[2]
+        },
+    )
 }
 
 #[repr(C)]
@@ -931,3 +1074,42 @@ impl fmt::Display for RendererInitError {
 }
 
 impl Error for RendererInitError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_bounds_match_chunk_world_space() {
+        let bounds = chunk_bounds(ChunkCoord::new(-1, 2, 3));
+
+        assert_eq!(bounds.min, [-32.0, 64.0, 96.0]);
+        assert_eq!(bounds.max, [0.0, 96.0, 128.0]);
+    }
+
+    #[test]
+    fn camera_frustum_accepts_visible_chunk_bounds() {
+        let mut camera = VoxelCamera::new([0.0, 0.0, 0.0], 0.0, 0.0);
+        camera.fov_y_radians = 90.0_f32.to_radians();
+        camera.near = 0.1;
+        camera.far = 96.0;
+
+        let frustum = CameraFrustum::from_camera(camera, 16.0 / 9.0);
+
+        assert!(frustum.intersects_aabb(chunk_bounds(ChunkCoord::new(1, 0, 0))));
+    }
+
+    #[test]
+    fn camera_frustum_rejects_chunk_bounds_outside_view() {
+        let mut camera = VoxelCamera::new([0.0, 0.0, 0.0], 0.0, 0.0);
+        camera.fov_y_radians = 90.0_f32.to_radians();
+        camera.near = 0.1;
+        camera.far = 96.0;
+
+        let frustum = CameraFrustum::from_camera(camera, 16.0 / 9.0);
+
+        assert!(!frustum.intersects_aabb(chunk_bounds(ChunkCoord::new(-2, 0, 0))));
+        assert!(!frustum.intersects_aabb(chunk_bounds(ChunkCoord::new(4, 0, 0))));
+        assert!(!frustum.intersects_aabb(chunk_bounds(ChunkCoord::new(1, 0, 4))));
+    }
+}

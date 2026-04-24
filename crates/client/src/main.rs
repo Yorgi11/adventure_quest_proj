@@ -5,14 +5,16 @@ use std::{
 };
 
 use foundation::{BlockPos, ChunkCoord};
-use gameplay::{break_target_block, place_selected_block, BlockInteraction, Hotbar};
+use gameplay::{
+    break_target_block, place_selected_block, BlockInteraction, Hotbar, HOTBAR_SLOT_COUNT,
+};
 use meshing::{mesh_chunk, mesh_dirty_subchunks, MeshData};
 use physics::raycast_blocks;
 use renderer::{ChunkMeshUpload, ClearRenderer, VoxelCamera};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
@@ -48,6 +50,8 @@ struct AdventureQuestApp {
     last_frame: Option<Instant>,
     show_fps: bool,
     fps_counter: FpsCounter,
+    world: Option<VoxelWorld>,
+    hotbar: Hotbar,
 }
 
 impl AdventureQuestApp {
@@ -60,6 +64,8 @@ impl AdventureQuestApp {
             last_frame: None,
             show_fps,
             fps_counter: FpsCounter::default(),
+            world: None,
+            hotbar: Hotbar::starter(),
         }
     }
 }
@@ -97,12 +103,12 @@ impl ApplicationHandler for AdventureQuestApp {
             renderer.set_fps_overlay(Some(0));
         }
 
-        let meshes = build_window_meshes();
+        let window_world = build_window_world();
 
-        if meshes.is_empty() {
+        if window_world.meshes.is_empty() {
             eprintln!("No chunk meshes were available for the first rendered frame");
         } else {
-            renderer.upload_chunk_meshes(meshes.iter().map(WindowChunkMesh::upload));
+            renderer.upload_chunk_meshes(window_world.meshes.iter().map(WindowChunkMesh::upload));
             println!(
                 "Uploaded {} chunk meshes to renderer ({} indices)",
                 renderer.mesh_count(),
@@ -110,6 +116,7 @@ impl ApplicationHandler for AdventureQuestApp {
             );
         }
 
+        self.world = Some(window_world.world);
         self.renderer = Some(renderer);
         self.window = Some(window.clone());
         window.request_redraw();
@@ -137,11 +144,21 @@ impl ApplicationHandler for AdventureQuestApp {
 
                     if key == KeyCode::Escape && pressed {
                         event_loop.exit();
+                    } else if pressed && self.select_hotbar_key(key) {
                     } else {
                         self.input.set_key(key, pressed);
                     }
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => match button {
+                MouseButton::Left => self.interact_with_target(BlockAction::Break),
+                MouseButton::Right => self.interact_with_target(BlockAction::Place),
+                _ => {}
+            },
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
@@ -202,6 +219,56 @@ impl AdventureQuestApp {
         self.camera.translate_local(forward, right, up);
         self.camera.rotate(yaw, pitch);
     }
+
+    fn select_hotbar_key(&mut self, key: KeyCode) -> bool {
+        let Some(slot) = hotbar_slot_for_key(key) else {
+            return false;
+        };
+
+        if self.hotbar.select_slot(slot) {
+            println!(
+                "Selected hotbar slot {} (block id {})",
+                slot + 1,
+                self.hotbar.selected_block()
+            );
+        }
+
+        true
+    }
+
+    fn interact_with_target(&mut self, action: BlockAction) {
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+
+        let origin = self.camera.position;
+        let direction = self.camera.forward_direction();
+        let result = match action {
+            BlockAction::Break => break_target_block(world, origin, direction, PLAYER_REACH),
+            BlockAction::Place => {
+                place_selected_block(world, &self.hotbar, origin, direction, PLAYER_REACH)
+            }
+        };
+        let changed_blocks = changed_block_count(result);
+
+        print_window_interaction(result);
+
+        if changed_blocks == 0 {
+            return;
+        }
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            upload_window_meshes(world, renderer);
+        }
+    }
+}
+
+const PLAYER_REACH: f32 = 8.0;
+
+#[derive(Debug, Clone, Copy)]
+enum BlockAction {
+    Break,
+    Place,
 }
 
 #[derive(Debug, Default)]
@@ -292,6 +359,28 @@ fn axis(positive: bool, negative: bool) -> f32 {
     }
 }
 
+fn hotbar_slot_for_key(key: KeyCode) -> Option<usize> {
+    let slot = match key {
+        KeyCode::Digit1 => 0,
+        KeyCode::Digit2 => 1,
+        KeyCode::Digit3 => 2,
+        KeyCode::Digit4 => 3,
+        KeyCode::Digit5 => 4,
+        KeyCode::Digit6 => 5,
+        KeyCode::Digit7 => 6,
+        KeyCode::Digit8 => 7,
+        KeyCode::Digit9 => 8,
+        _ => return None,
+    };
+
+    (slot < HOTBAR_SLOT_COUNT).then_some(slot)
+}
+
+struct WindowWorldState {
+    world: VoxelWorld,
+    meshes: Vec<WindowChunkMesh>,
+}
+
 struct WindowChunkMesh {
     coord: ChunkCoord,
     revision: u32,
@@ -310,12 +399,29 @@ impl WindowChunkMesh {
     }
 }
 
-fn build_window_meshes() -> Vec<WindowChunkMesh> {
+fn build_window_world() -> WindowWorldState {
     let mut world = VoxelWorld::new(12345);
     let player_block = BlockPos::new(0, 40, 0);
 
     world.load_chunks_around_block(player_block, WorldStreamingSettings::prototype());
 
+    let meshes = build_window_meshes(&mut world);
+
+    WindowWorldState { world, meshes }
+}
+
+fn upload_window_meshes(world: &mut VoxelWorld, renderer: &mut ClearRenderer) {
+    let meshes = build_window_meshes(world);
+
+    renderer.upload_chunk_meshes(meshes.iter().map(WindowChunkMesh::upload));
+    println!(
+        "Updated {} chunk meshes after edit ({} indices)",
+        renderer.mesh_count(),
+        renderer.index_count()
+    );
+}
+
+fn build_window_meshes(world: &mut VoxelWorld) -> Vec<WindowChunkMesh> {
     let mut coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
     coords.sort_by_key(|coord| (coord.y, coord.z, coord.x));
 
@@ -332,7 +438,10 @@ fn build_window_meshes() -> Vec<WindowChunkMesh> {
             .unwrap_or_default();
         let visible_mask = mesh.subchunk_visible_mask;
 
-        world.set_chunk_visible_mask(coord, visible_mask);
+        if let Some(chunk) = world.get_chunk_mut(coord) {
+            chunk.subchunk_visible_mask = visible_mask;
+            chunk.clear_dirty();
+        }
 
         if !mesh.indices.is_empty() {
             meshes.push(WindowChunkMesh {
@@ -345,6 +454,29 @@ fn build_window_meshes() -> Vec<WindowChunkMesh> {
     }
 
     meshes
+}
+
+fn print_window_interaction(interaction: BlockInteraction) {
+    match interaction {
+        BlockInteraction::Break { hit, summary } => {
+            if summary.changed_blocks > 0 {
+                println!("Broke block {:?} ({})", hit.world_block, hit.block_id);
+            }
+        }
+        BlockInteraction::Place {
+            placed_block,
+            block,
+            summary,
+            ..
+        } => {
+            if summary.changed_blocks > 0 {
+                println!("Placed block {block} at {:?}", placed_block);
+            }
+        }
+        BlockInteraction::Miss => println!("No block in reach"),
+        BlockInteraction::NoPlaceableBlockSelected => println!("Selected hotbar slot is empty"),
+        BlockInteraction::InvalidPlacementFace { .. } => println!("Cannot place from inside block"),
+    }
 }
 
 fn run_voxel_prototype() {

@@ -213,11 +213,11 @@ fn add_face(mesh: &mut MeshData, pos: BlockPos, dir: Direction, block_id: BlockI
 
     mesh.indices.extend_from_slice(&[
         base_index,
+        base_index + 2,
         base_index + 1,
-        base_index + 2,
         base_index,
-        base_index + 2,
         base_index + 3,
+        base_index + 2,
     ]);
 
     mesh.visible_face_count += 1;
@@ -344,5 +344,49 @@ mod tests {
         assert_eq!(neighbor_mesh.visible_face_count, 5);
         assert_eq!(origin_mesh.subchunk_visible_mask, subchunk_bit(1));
         assert_eq!(neighbor_mesh.subchunk_visible_mask, subchunk_bit(0));
+    }
+
+    #[test]
+    fn generated_triangles_are_wound_toward_their_face_normals() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_empty_chunk(coord);
+
+        world.set_block(BlockPos::new(0, 0, 0), STONE_BLOCK);
+
+        let mesh = mesh_chunk(&world, coord).expect("chunk exists");
+
+        for triangle in mesh.indices.chunks_exact(3) {
+            let a = mesh.vertices[triangle[0] as usize];
+            let b = mesh.vertices[triangle[1] as usize];
+            let c = mesh.vertices[triangle[2] as usize];
+            let normal = triangle_normal(a.position, b.position, c.position);
+
+            assert!(
+                dot(normal, a.normal) > 0.0,
+                "triangle normal {:?} should face vertex normal {:?}",
+                normal,
+                a.normal
+            );
+        }
+    }
+
+    fn triangle_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+        cross(subtract(b, a), subtract(c, a))
+    }
+
+    fn subtract(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
     }
 }
