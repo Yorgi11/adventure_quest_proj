@@ -1,0 +1,9 @@
+[package]
+name = "voxels"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+foundation.workspace = true

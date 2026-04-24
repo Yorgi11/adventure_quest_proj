@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/client",
+    "crates/foundation",
+    "crates/voxels",
+    "crates/world",
+    "crates/terrain",
+    "crates/meshing",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["Michael Giorgi"]
+license = "Proprietary"
+
+[workspace.dependencies]
+foundation = { path = "crates/foundation" }
+voxels = { path = "crates/voxels" }
+world = { path = "crates/world" }
+terrain = { path = "crates/terrain" }
+meshing = { path = "crates/meshing" }

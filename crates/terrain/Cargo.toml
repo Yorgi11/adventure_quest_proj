@@ -1,0 +1,10 @@
+[package]
+name = "terrain"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+foundation.workspace = true
+voxels.workspace = true
