@@ -34,3 +34,17 @@ cargo run -p client -- --fps-window
 cargo run -p client -- --fps-window --no-vsync
 cargo run -p client -- --no-window
 ```
+
+## Window controls
+
+```text
+WASD        Move
+Mouse       Look
+Space       Jump
+Shift       Sprint
+Left click  Break block
+Right click Place selected block
+1-9         Select hotbar slot
+V           Toggle noclip debug movement
+Esc         Exit
+```

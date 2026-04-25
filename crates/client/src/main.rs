@@ -10,8 +10,9 @@ use gameplay::{
     break_target_block, place_selected_block, BlockInteraction, Hotbar, HOTBAR_SLOT_COUNT,
 };
 use meshing::{mesh_chunk, mesh_dirty_subchunks, MeshData};
-use physics::raycast_blocks;
+use physics::{move_aabb_through_voxels, raycast_blocks};
 use renderer::{ChunkMeshUpload, ClearRenderer, RendererOptions, VoxelCamera};
+use voxels::{world_to_chunk_coord, SUBCHUNK_COUNT};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
@@ -91,9 +92,12 @@ struct AdventureQuestApp {
     renderer_options: RendererOptions,
     fps_counter: FpsCounter,
     world: Option<VoxelWorld>,
+    player: PlayerController,
     hotbar: Hotbar,
+    noclip_enabled: bool,
     mouse_look_active: bool,
     dirty_mesh_queue: DirtyMeshQueue,
+    streaming: ChunkStreamingState,
 }
 
 impl AdventureQuestApp {
@@ -108,9 +112,12 @@ impl AdventureQuestApp {
             renderer_options: options.renderer,
             fps_counter: FpsCounter::default(),
             world: None,
+            player: PlayerController::from_camera(VoxelCamera::looking_at_chunk_origin()),
             hotbar: Hotbar::starter(),
+            noclip_enabled: false,
             mouse_look_active: false,
             dirty_mesh_queue: DirtyMeshQueue::default(),
+            streaming: ChunkStreamingState::default(),
         }
     }
 }
@@ -218,6 +225,8 @@ impl ApplicationHandler for AdventureQuestApp {
 
                     if key == KeyCode::Escape && pressed {
                         event_loop.exit();
+                    } else if key == KeyCode::KeyV && pressed {
+                        self.toggle_noclip();
                     } else if pressed && self.select_hotbar_key(key) {
                     } else {
                         self.input.set_key(key, pressed);
@@ -243,7 +252,8 @@ impl ApplicationHandler for AdventureQuestApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.advance_camera();
+                self.advance_player();
+                self.process_chunk_streaming();
                 self.process_dirty_mesh_queue();
 
                 let fps_update = if self.show_fps {
@@ -274,7 +284,7 @@ impl ApplicationHandler for AdventureQuestApp {
 }
 
 impl AdventureQuestApp {
-    fn advance_camera(&mut self) {
+    fn advance_player(&mut self) {
         let now = Instant::now();
         let dt = self
             .last_frame
@@ -286,6 +296,22 @@ impl AdventureQuestApp {
             return;
         }
 
+        if self.noclip_enabled {
+            self.advance_noclip_camera(dt);
+            self.player = PlayerController::from_camera(self.camera);
+            return;
+        }
+
+        let Some(world) = self.world.as_ref() else {
+            return;
+        };
+
+        self.player
+            .step(world, self.camera.yaw_radians, self.input, dt);
+        self.camera.position = self.player.camera_position();
+    }
+
+    fn advance_noclip_camera(&mut self, dt: f32) {
         let movement_speed = if self.input.fast { 42.0 } else { 18.0 };
 
         let forward = self.input.forward_axis() * movement_speed * dt;
@@ -343,6 +369,17 @@ impl AdventureQuestApp {
         true
     }
 
+    fn toggle_noclip(&mut self) {
+        self.noclip_enabled = !self.noclip_enabled;
+        self.player = PlayerController::from_camera(self.camera);
+
+        if self.noclip_enabled {
+            println!("Noclip enabled");
+        } else {
+            println!("Noclip disabled");
+        }
+    }
+
     fn interact_with_target(&mut self, action: BlockAction) {
         let Some(world) = self.world.as_mut() else {
             return;
@@ -385,15 +422,127 @@ impl AdventureQuestApp {
             upload_window_chunk_mesh(world, renderer, coord);
         }
     }
+
+    fn process_chunk_streaming(&mut self) {
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+
+        let center = camera_chunk_coord(self.camera);
+        if self.streaming.update_center(center) {
+            println!("Streaming around chunk {:?}", center);
+        }
+
+        for _ in 0..CHUNK_LOADS_PER_FRAME {
+            let Some(coord) = self.streaming.pop_missing(world) else {
+                break;
+            };
+
+            if !world.load_chunk(coord) {
+                continue;
+            }
+
+            for dirty_coord in mark_streamed_chunk_dirty(world, coord) {
+                self.dirty_mesh_queue.enqueue(dirty_coord);
+            }
+        }
+    }
 }
 
 fn window_center_position(size: PhysicalSize<u32>) -> PhysicalPosition<f64> {
     PhysicalPosition::new(size.width as f64 * 0.5, size.height as f64 * 0.5)
 }
 
+fn camera_chunk_coord(camera: VoxelCamera) -> ChunkCoord {
+    let pos = camera_block_position(camera.position);
+    world_to_chunk_coord(pos.x, pos.y, pos.z)
+}
+
+fn camera_block_position(position: [f32; 3]) -> BlockPos {
+    BlockPos::new(
+        position[0].floor() as i32,
+        position[1].floor() as i32,
+        position[2].floor() as i32,
+    )
+}
+
+fn streaming_chunk_coords(
+    center: ChunkCoord,
+    settings: WorldStreamingSettings,
+) -> VecDeque<ChunkCoord> {
+    let horizontal_radius = settings.horizontal_load_radius.max(0);
+    let vertical_radius = settings.vertical_load_radius.max(0);
+    let mut coords = Vec::new();
+
+    for dy in -vertical_radius..=vertical_radius {
+        for dz in -horizontal_radius..=horizontal_radius {
+            for dx in -horizontal_radius..=horizontal_radius {
+                coords.push(center.offset(dx, dy, dz));
+            }
+        }
+    }
+
+    coords.sort_by_key(|coord| chunk_distance_key(center, *coord));
+    coords.into()
+}
+
+fn chunk_distance_key(center: ChunkCoord, coord: ChunkCoord) -> i32 {
+    let dx = coord.x - center.x;
+    let dy = coord.y - center.y;
+    let dz = coord.z - center.z;
+
+    dx * dx + dy * dy + dz * dz
+}
+
+fn mark_streamed_chunk_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> Vec<ChunkCoord> {
+    let mut dirty_coords = Vec::new();
+
+    for dirty_coord in [coord]
+        .into_iter()
+        .chain(neighbor_chunk_coords(coord).into_iter())
+    {
+        if mark_all_subchunks_dirty(world, dirty_coord) {
+            dirty_coords.push(dirty_coord);
+        }
+    }
+
+    dirty_coords
+}
+
+fn neighbor_chunk_coords(coord: ChunkCoord) -> [ChunkCoord; 6] {
+    [
+        coord.offset(1, 0, 0),
+        coord.offset(-1, 0, 0),
+        coord.offset(0, 1, 0),
+        coord.offset(0, -1, 0),
+        coord.offset(0, 0, 1),
+        coord.offset(0, 0, -1),
+    ]
+}
+
+fn mark_all_subchunks_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> bool {
+    let Some(chunk) = world.get_chunk_mut(coord) else {
+        return false;
+    };
+
+    for subchunk in 0..SUBCHUNK_COUNT {
+        chunk.mark_subchunk_dirty(subchunk);
+    }
+
+    true
+}
+
 const PLAYER_REACH: f32 = 8.0;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 const DIRTY_MESH_UPLOADS_PER_FRAME: usize = 1;
+const CHUNK_LOADS_PER_FRAME: usize = 1;
+const PLAYER_HALF_EXTENTS: [f32; 3] = [0.3, 0.9, 0.3];
+const PLAYER_EYE_HEIGHT: f32 = 1.62;
+const PLAYER_WALK_SPEED: f32 = 5.5;
+const PLAYER_SPRINT_SPEED: f32 = 8.5;
+const PLAYER_JUMP_SPEED: f32 = 8.0;
+const PLAYER_GRAVITY: f32 = 24.0;
+const PLAYER_MAX_FALL_SPEED: f32 = 48.0;
 
 #[derive(Debug, Clone, Copy)]
 enum BlockAction {
@@ -425,6 +574,97 @@ impl FpsCounter {
 
         Some(fps)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlayerController {
+    center: [f32; 3],
+    velocity: [f32; 3],
+    on_ground: bool,
+}
+
+impl PlayerController {
+    fn from_camera(camera: VoxelCamera) -> Self {
+        Self {
+            center: camera_position_to_player_center(camera.position),
+            velocity: [0.0; 3],
+            on_ground: false,
+        }
+    }
+
+    fn camera_position(self) -> [f32; 3] {
+        player_center_to_camera_position(self.center)
+    }
+
+    fn step(&mut self, world: &VoxelWorld, yaw_radians: f32, input: InputState, dt: f32) {
+        let (mut horizontal_x, mut horizontal_z) = horizontal_movement(yaw_radians, input);
+        let horizontal_length = (horizontal_x * horizontal_x + horizontal_z * horizontal_z).sqrt();
+
+        if horizontal_length > 1.0 {
+            horizontal_x /= horizontal_length;
+            horizontal_z /= horizontal_length;
+        }
+
+        let movement_speed = if input.fast {
+            PLAYER_SPRINT_SPEED
+        } else {
+            PLAYER_WALK_SPEED
+        };
+
+        self.velocity[0] = horizontal_x * movement_speed;
+        self.velocity[2] = horizontal_z * movement_speed;
+
+        if input.up && self.on_ground {
+            self.velocity[1] = PLAYER_JUMP_SPEED;
+            self.on_ground = false;
+        }
+
+        self.velocity[1] = (self.velocity[1] - PLAYER_GRAVITY * dt).max(-PLAYER_MAX_FALL_SPEED);
+
+        let delta = [
+            self.velocity[0] * dt,
+            self.velocity[1] * dt,
+            self.velocity[2] * dt,
+        ];
+        let collision = move_aabb_through_voxels(world, self.center, PLAYER_HALF_EXTENTS, delta);
+
+        self.center = collision.center;
+        self.on_ground = collision.on_ground;
+
+        for axis in 0..3 {
+            if collision.collided[axis] {
+                self.velocity[axis] = 0.0;
+            }
+        }
+    }
+}
+
+fn camera_position_to_player_center(camera_position: [f32; 3]) -> [f32; 3] {
+    [
+        camera_position[0],
+        camera_position[1] - PLAYER_EYE_HEIGHT + PLAYER_HALF_EXTENTS[1],
+        camera_position[2],
+    ]
+}
+
+fn player_center_to_camera_position(center: [f32; 3]) -> [f32; 3] {
+    [
+        center[0],
+        center[1] + PLAYER_EYE_HEIGHT - PLAYER_HALF_EXTENTS[1],
+        center[2],
+    ]
+}
+
+fn horizontal_movement(yaw_radians: f32, input: InputState) -> (f32, f32) {
+    let forward_axis = input.forward_axis();
+    let right_axis = input.right_axis();
+    let forward = (yaw_radians.cos(), yaw_radians.sin());
+    let right = (-yaw_radians.sin(), yaw_radians.cos());
+
+    (
+        forward.0 * forward_axis + right.0 * right_axis,
+        forward.1 * forward_axis + right.1 * right_axis,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -463,6 +703,50 @@ impl DirtyMeshQueue {
     #[cfg(test)]
     fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+}
+
+#[derive(Debug)]
+struct ChunkStreamingState {
+    settings: WorldStreamingSettings,
+    center_chunk: Option<ChunkCoord>,
+    pending_loads: VecDeque<ChunkCoord>,
+}
+
+impl ChunkStreamingState {
+    fn update_center(&mut self, center: ChunkCoord) -> bool {
+        if self.center_chunk == Some(center) {
+            return false;
+        }
+
+        self.center_chunk = Some(center);
+        self.pending_loads = streaming_chunk_coords(center, self.settings).into();
+        true
+    }
+
+    fn pop_missing(&mut self, world: &VoxelWorld) -> Option<ChunkCoord> {
+        while let Some(coord) = self.pending_loads.pop_front() {
+            if world.get_chunk(coord).is_none() {
+                return Some(coord);
+            }
+        }
+
+        None
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.pending_loads.len()
+    }
+}
+
+impl Default for ChunkStreamingState {
+    fn default() -> Self {
+        Self {
+            settings: WorldStreamingSettings::prototype(),
+            center_chunk: None,
+            pending_loads: VecDeque::new(),
+        }
     }
 }
 
@@ -770,6 +1054,16 @@ mod tests {
         world
     }
 
+    fn world_with_empty_chunks(coords: impl IntoIterator<Item = ChunkCoord>) -> VoxelWorld {
+        let mut world = VoxelWorld::new(0);
+
+        for coord in coords {
+            world.chunks.insert(coord, Chunk::new_empty(coord));
+        }
+
+        world
+    }
+
     #[test]
     fn dirty_mesh_queue_deduplicates_dirty_chunks() {
         let coord = ChunkCoord::new(0, 0, 0);
@@ -820,5 +1114,100 @@ mod tests {
         assert!(options.no_window);
         assert!(!options.show_fps);
         assert_eq!(options.renderer, RendererOptions::default());
+    }
+
+    #[test]
+    fn camera_block_position_floors_negative_coordinates() {
+        assert_eq!(
+            camera_block_position([-0.1, 42.9, -32.0]),
+            BlockPos::new(-1, 42, -32)
+        );
+    }
+
+    #[test]
+    fn streaming_chunk_coords_start_with_nearest_chunk() {
+        let center = ChunkCoord::new(4, -2, 7);
+        let coords = streaming_chunk_coords(center, WorldStreamingSettings::prototype());
+
+        assert_eq!(coords.len(), 27);
+        assert_eq!(coords.front().copied(), Some(center));
+        assert!(coords.contains(&center.offset(1, 1, -1)));
+    }
+
+    #[test]
+    fn chunk_streaming_state_skips_loaded_chunks() {
+        let center = ChunkCoord::new(0, 0, 0);
+        let mut state = ChunkStreamingState::default();
+        let world = world_with_empty_chunks([center]);
+
+        assert!(state.update_center(center));
+
+        let first_missing = state.pop_missing(&world);
+
+        assert_ne!(first_missing, Some(center));
+        assert_eq!(state.pending_count(), 25);
+    }
+
+    #[test]
+    fn streamed_chunk_dirty_marking_updates_loaded_neighbors() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let neighbor = coord.offset(1, 0, 0);
+        let missing_neighbor = coord.offset(-1, 0, 0);
+        let mut world = world_with_empty_chunks([coord, neighbor]);
+
+        let dirty = mark_streamed_chunk_dirty(&mut world, coord);
+
+        assert!(dirty.contains(&coord));
+        assert!(dirty.contains(&neighbor));
+        assert!(!dirty.contains(&missing_neighbor));
+
+        let expected_mask = ((1u16 << SUBCHUNK_COUNT) - 1) as u8;
+        assert_eq!(
+            world.get_chunk(coord).unwrap().subchunk_dirty_mask,
+            expected_mask
+        );
+        assert_eq!(
+            world.get_chunk(neighbor).unwrap().subchunk_dirty_mask,
+            expected_mask
+        );
+    }
+
+    #[test]
+    fn player_camera_position_round_trips_through_body_center() {
+        let camera_position = [12.0, 35.5, -8.0];
+        let center = camera_position_to_player_center(camera_position);
+
+        assert_eq!(player_center_to_camera_position(center), camera_position);
+    }
+
+    #[test]
+    fn horizontal_movement_uses_camera_yaw() {
+        let mut input = InputState::default();
+        input.forward = true;
+
+        assert_eq!(horizontal_movement(0.0, input), (1.0, 0.0));
+
+        input.forward = false;
+        input.right = true;
+
+        assert_eq!(horizontal_movement(0.0, input), (0.0, 1.0));
+    }
+
+    #[test]
+    fn player_controller_lands_on_voxel_floor() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_empty_chunks([coord]);
+        world.set_block(BlockPos::new(0, 0, 0), STONE_BLOCK);
+        let mut player = PlayerController {
+            center: [0.5, 2.5, 0.5],
+            velocity: [0.0, -20.0, 0.0],
+            on_ground: false,
+        };
+
+        player.step(&world, 0.0, InputState::default(), 0.05);
+
+        assert!((player.center[1] - 1.901).abs() < 0.0001);
+        assert_eq!(player.velocity[1], 0.0);
+        assert!(player.on_ground);
     }
 }
