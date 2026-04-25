@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     error::Error,
     sync::Arc,
     time::{Duration, Instant},
@@ -10,36 +11,74 @@ use gameplay::{
 };
 use meshing::{mesh_chunk, mesh_dirty_subchunks, MeshData};
 use physics::raycast_blocks;
-use renderer::{ChunkMeshUpload, ClearRenderer, VoxelCamera};
+use renderer::{ChunkMeshUpload, ClearRenderer, RendererOptions, VoxelCamera};
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
-    event::{ElementState, MouseButton, WindowEvent},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId},
+    window::{CursorGrabMode, Window, WindowId},
 };
 use world::{VoxelWorld, WorldStreamingSettings};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let options = ClientOptions::from_args(std::env::args().skip(1));
 
     run_voxel_prototype();
 
-    if args.iter().any(|arg| arg == "--no-window") {
+    if options.no_window {
         return Ok(());
     }
 
-    run_window(args.iter().any(|arg| arg == "--fps-window"))
+    run_window(options)
 }
 
-fn run_window(show_fps: bool) -> Result<(), Box<dyn Error>> {
+fn run_window(options: ClientOptions) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
-    let mut app = AdventureQuestApp::new(show_fps);
+    let mut app = AdventureQuestApp::new(options);
 
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientOptions {
+    no_window: bool,
+    show_fps: bool,
+    renderer: RendererOptions,
+}
+
+impl ClientOptions {
+    fn from_args<I>(args: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let mut options = Self::default();
+
+        for arg in args {
+            match arg.as_ref() {
+                "--no-window" => options.no_window = true,
+                "--fps-window" => options.show_fps = true,
+                "--no-vsync" => options.renderer.vsync = false,
+                _ => {}
+            }
+        }
+
+        options
+    }
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            no_window: false,
+            show_fps: false,
+            renderer: RendererOptions::default(),
+        }
+    }
 }
 
 struct AdventureQuestApp {
@@ -49,23 +88,29 @@ struct AdventureQuestApp {
     camera: VoxelCamera,
     last_frame: Option<Instant>,
     show_fps: bool,
+    renderer_options: RendererOptions,
     fps_counter: FpsCounter,
     world: Option<VoxelWorld>,
     hotbar: Hotbar,
+    mouse_look_active: bool,
+    dirty_mesh_queue: DirtyMeshQueue,
 }
 
 impl AdventureQuestApp {
-    fn new(show_fps: bool) -> Self {
+    fn new(options: ClientOptions) -> Self {
         Self {
             window: None,
             renderer: None,
             input: InputState::default(),
             camera: VoxelCamera::looking_at_chunk_origin(),
             last_frame: None,
-            show_fps,
+            show_fps: options.show_fps,
+            renderer_options: options.renderer,
             fps_counter: FpsCounter::default(),
             world: None,
             hotbar: Hotbar::starter(),
+            mouse_look_active: false,
+            dirty_mesh_queue: DirtyMeshQueue::default(),
         }
     }
 }
@@ -89,7 +134,13 @@ impl ApplicationHandler for AdventureQuestApp {
             }
         };
 
-        let mut renderer = match pollster::block_on(ClearRenderer::new(window.clone())) {
+        window.focus_window();
+        self.capture_mouse(&window);
+
+        let mut renderer = match pollster::block_on(ClearRenderer::new_with_options(
+            window.clone(),
+            self.renderer_options,
+        )) {
             Ok(renderer) => renderer,
             Err(error) => {
                 eprintln!("Failed to initialize renderer: {error}");
@@ -99,6 +150,7 @@ impl ApplicationHandler for AdventureQuestApp {
         };
 
         renderer.set_camera(self.camera);
+        renderer.set_crosshair_enabled(true);
         if self.show_fps {
             renderer.set_fps_overlay(Some(0));
         }
@@ -122,6 +174,19 @@ impl ApplicationHandler for AdventureQuestApp {
         window.request_redraw();
     }
 
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        let DeviceEvent::MouseMotion { delta } = event else {
+            return;
+        };
+
+        self.apply_mouse_look(delta);
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -138,6 +203,15 @@ impl ApplicationHandler for AdventureQuestApp {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                if focused {
+                    self.capture_mouse(&window);
+                } else {
+                    self.mouse_look_active = false;
+                    window.set_cursor_visible(true);
+                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
@@ -154,11 +228,15 @@ impl ApplicationHandler for AdventureQuestApp {
                 state: ElementState::Pressed,
                 button,
                 ..
-            } => match button {
-                MouseButton::Left => self.interact_with_target(BlockAction::Break),
-                MouseButton::Right => self.interact_with_target(BlockAction::Place),
-                _ => {}
-            },
+            } => {
+                self.capture_mouse(&window);
+
+                match button {
+                    MouseButton::Left => self.interact_with_target(BlockAction::Break),
+                    MouseButton::Right => self.interact_with_target(BlockAction::Place),
+                    _ => {}
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
@@ -166,6 +244,7 @@ impl ApplicationHandler for AdventureQuestApp {
             }
             WindowEvent::RedrawRequested => {
                 self.advance_camera();
+                self.process_dirty_mesh_queue();
 
                 let fps_update = if self.show_fps {
                     self.fps_counter.record_frame(Instant::now())
@@ -208,16 +287,44 @@ impl AdventureQuestApp {
         }
 
         let movement_speed = if self.input.fast { 42.0 } else { 18.0 };
-        let rotation_speed = 1.75;
 
         let forward = self.input.forward_axis() * movement_speed * dt;
         let right = self.input.right_axis() * movement_speed * dt;
         let up = self.input.up_axis() * movement_speed * dt;
-        let yaw = self.input.yaw_axis() * rotation_speed * dt;
-        let pitch = self.input.pitch_axis() * rotation_speed * dt;
 
         self.camera.translate_local(forward, right, up);
+    }
+
+    fn apply_mouse_look(&mut self, delta: (f64, f64)) {
+        if !self.mouse_look_active {
+            return;
+        }
+
+        let yaw = delta.0 as f32 * MOUSE_SENSITIVITY;
+        let pitch = -(delta.1 as f32) * MOUSE_SENSITIVITY;
+
         self.camera.rotate(yaw, pitch);
+    }
+
+    fn capture_mouse(&mut self, window: &Window) {
+        window.focus_window();
+        let _ = window.set_cursor_position(window_center_position(window.inner_size()));
+        window.set_cursor_visible(false);
+
+        match window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+        {
+            Ok(()) => {
+                let _ = window.set_cursor_position(window_center_position(window.inner_size()));
+                self.mouse_look_active = true;
+            }
+            Err(error) => {
+                self.mouse_look_active = false;
+                window.set_cursor_visible(true);
+                eprintln!("Mouse capture unavailable: {error}");
+            }
+        }
     }
 
     fn select_hotbar_key(&mut self, key: KeyCode) -> bool {
@@ -257,13 +364,36 @@ impl AdventureQuestApp {
             return;
         }
 
-        if let Some(renderer) = self.renderer.as_mut() {
-            upload_window_meshes(world, renderer);
+        self.dirty_mesh_queue.enqueue_dirty(world);
+    }
+
+    fn process_dirty_mesh_queue(&mut self) {
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+
+        self.dirty_mesh_queue.enqueue_dirty(world);
+
+        for _ in 0..DIRTY_MESH_UPLOADS_PER_FRAME {
+            let Some(coord) = self.dirty_mesh_queue.pop_dirty(world) else {
+                break;
+            };
+
+            upload_window_chunk_mesh(world, renderer, coord);
         }
     }
 }
 
+fn window_center_position(size: PhysicalSize<u32>) -> PhysicalPosition<f64> {
+    PhysicalPosition::new(size.width as f64 * 0.5, size.height as f64 * 0.5)
+}
+
 const PLAYER_REACH: f32 = 8.0;
+const MOUSE_SENSITIVITY: f32 = 0.0025;
+const DIRTY_MESH_UPLOADS_PER_FRAME: usize = 1;
 
 #[derive(Debug, Clone, Copy)]
 enum BlockAction {
@@ -297,6 +427,45 @@ impl FpsCounter {
     }
 }
 
+#[derive(Debug, Default)]
+struct DirtyMeshQueue {
+    pending: VecDeque<ChunkCoord>,
+}
+
+impl DirtyMeshQueue {
+    fn enqueue_dirty(&mut self, world: &VoxelWorld) {
+        for coord in dirty_window_chunk_coords(world) {
+            self.enqueue(coord);
+        }
+    }
+
+    fn enqueue(&mut self, coord: ChunkCoord) {
+        if !self.pending.contains(&coord) {
+            self.pending.push_back(coord);
+        }
+    }
+
+    fn pop_dirty(&mut self, world: &VoxelWorld) -> Option<ChunkCoord> {
+        while let Some(coord) = self.pending.pop_front() {
+            let is_dirty = world
+                .get_chunk(coord)
+                .map(|chunk| chunk.subchunk_dirty_mask != 0)
+                .unwrap_or(false);
+
+            if is_dirty {
+                return Some(coord);
+            }
+        }
+
+        None
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct InputState {
     forward: bool,
@@ -305,10 +474,6 @@ struct InputState {
     right: bool,
     up: bool,
     down: bool,
-    yaw_left: bool,
-    yaw_right: bool,
-    pitch_up: bool,
-    pitch_down: bool,
     fast: bool,
 }
 
@@ -321,10 +486,6 @@ impl InputState {
             KeyCode::KeyD => self.right = pressed,
             KeyCode::Space => self.up = pressed,
             KeyCode::ControlLeft | KeyCode::ControlRight => self.down = pressed,
-            KeyCode::ArrowLeft => self.yaw_left = pressed,
-            KeyCode::ArrowRight => self.yaw_right = pressed,
-            KeyCode::ArrowUp => self.pitch_up = pressed,
-            KeyCode::ArrowDown => self.pitch_down = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.fast = pressed,
             _ => {}
         }
@@ -340,14 +501,6 @@ impl InputState {
 
     fn up_axis(self) -> f32 {
         axis(self.up, self.down)
-    }
-
-    fn yaw_axis(self) -> f32 {
-        axis(self.yaw_right, self.yaw_left)
-    }
-
-    fn pitch_axis(self) -> f32 {
-        axis(self.pitch_up, self.pitch_down)
     }
 }
 
@@ -410,17 +563,6 @@ fn build_window_world() -> WindowWorldState {
     WindowWorldState { world, meshes }
 }
 
-fn upload_window_meshes(world: &mut VoxelWorld, renderer: &mut ClearRenderer) {
-    let meshes = build_window_meshes(world);
-
-    renderer.upload_chunk_meshes(meshes.iter().map(WindowChunkMesh::upload));
-    println!(
-        "Updated {} chunk meshes after edit ({} indices)",
-        renderer.mesh_count(),
-        renderer.index_count()
-    );
-}
-
 fn build_window_meshes(world: &mut VoxelWorld) -> Vec<WindowChunkMesh> {
     let mut coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
     coords.sort_by_key(|coord| (coord.y, coord.z, coord.x));
@@ -454,6 +596,45 @@ fn build_window_meshes(world: &mut VoxelWorld) -> Vec<WindowChunkMesh> {
     }
 
     meshes
+}
+
+fn dirty_window_chunk_coords(world: &VoxelWorld) -> Vec<ChunkCoord> {
+    let mut coords: Vec<ChunkCoord> = world
+        .chunks
+        .iter()
+        .filter_map(|(coord, chunk)| (chunk.subchunk_dirty_mask != 0).then_some(*coord))
+        .collect();
+
+    coords.sort_by_key(|coord| (coord.y, coord.z, coord.x));
+    coords
+}
+
+fn upload_window_chunk_mesh(
+    world: &mut VoxelWorld,
+    renderer: &mut ClearRenderer,
+    coord: ChunkCoord,
+) {
+    let Some(mesh) = mesh_chunk(world, coord) else {
+        renderer.remove_chunk_mesh(coord);
+        return;
+    };
+    let revision = world
+        .get_chunk(coord)
+        .map(|chunk| chunk.revision)
+        .unwrap_or_default();
+    let visible_mask = mesh.subchunk_visible_mask;
+
+    if let Some(chunk) = world.get_chunk_mut(coord) {
+        chunk.subchunk_visible_mask = visible_mask;
+        chunk.clear_dirty();
+    }
+
+    renderer.upload_chunk_mesh(ChunkMeshUpload {
+        coord,
+        revision,
+        visible_mask,
+        mesh: &mesh,
+    });
 }
 
 fn print_window_interaction(interaction: BlockInteraction) {
@@ -573,5 +754,71 @@ fn changed_block_count(interaction: BlockInteraction) -> usize {
         BlockInteraction::Miss
         | BlockInteraction::NoPlaceableBlockSelected
         | BlockInteraction::InvalidPlacementFace { .. } => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voxels::{Chunk, STONE_BLOCK};
+
+    fn world_with_dirty_chunk(coord: ChunkCoord) -> VoxelWorld {
+        let mut world = VoxelWorld::new(0);
+        let mut chunk = Chunk::new_empty(coord);
+        chunk.set_block(0, 0, 0, STONE_BLOCK);
+        world.chunks.insert(coord, chunk);
+        world
+    }
+
+    #[test]
+    fn dirty_mesh_queue_deduplicates_dirty_chunks() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let world = world_with_dirty_chunk(coord);
+        let mut queue = DirtyMeshQueue::default();
+
+        queue.enqueue_dirty(&world);
+        queue.enqueue_dirty(&world);
+
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.pop_dirty(&world), Some(coord));
+        assert_eq!(queue.pop_dirty(&world), None);
+    }
+
+    #[test]
+    fn dirty_mesh_queue_skips_chunks_that_are_no_longer_dirty() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_dirty_chunk(coord);
+        let mut queue = DirtyMeshQueue::default();
+
+        queue.enqueue_dirty(&world);
+        world.get_chunk_mut(coord).unwrap().clear_dirty();
+
+        assert_eq!(queue.pop_dirty(&world), None);
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn window_center_position_uses_inner_size_midpoint() {
+        let center = window_center_position(PhysicalSize::new(1280, 720));
+
+        assert_eq!(center, PhysicalPosition::new(640.0, 360.0));
+    }
+
+    #[test]
+    fn client_options_parse_window_flags() {
+        let options = ClientOptions::from_args(["--fps-window", "--no-vsync"]);
+
+        assert!(!options.no_window);
+        assert!(options.show_fps);
+        assert_eq!(options.renderer, RendererOptions::new(false));
+    }
+
+    #[test]
+    fn client_options_parse_no_window() {
+        let options = ClientOptions::from_args(["--no-window"]);
+
+        assert!(options.no_window);
+        assert!(!options.show_fps);
+        assert_eq!(options.renderer, RendererOptions::default());
     }
 }

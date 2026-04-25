@@ -134,8 +134,7 @@ fn mesh_block_range(
                 let world_pos = BlockPos::new(world_x, world_y, world_z);
 
                 for dir in ALL_DIRECTIONS {
-                    let neighbor_pos = offset_pos(world_pos, dir);
-                    let neighbor = world.get_block(neighbor_pos);
+                    let neighbor = neighbor_block(world, chunk, coord, x, y, z, dir);
 
                     if neighbor == AIR_BLOCK {
                         let subchunk = subchunk_index(x, y, z);
@@ -164,15 +163,48 @@ fn subchunk_axis_range(upper_half: bool) -> Range<usize> {
     }
 }
 
-fn offset_pos(pos: BlockPos, dir: Direction) -> BlockPos {
+fn neighbor_block(
+    world: &VoxelWorld,
+    chunk: &Chunk,
+    coord: ChunkCoord,
+    x: usize,
+    y: usize,
+    z: usize,
+    dir: Direction,
+) -> BlockId {
     match dir {
-        Direction::PosX => BlockPos::new(pos.x + 1, pos.y, pos.z),
-        Direction::NegX => BlockPos::new(pos.x - 1, pos.y, pos.z),
-        Direction::PosY => BlockPos::new(pos.x, pos.y + 1, pos.z),
-        Direction::NegY => BlockPos::new(pos.x, pos.y - 1, pos.z),
-        Direction::PosZ => BlockPos::new(pos.x, pos.y, pos.z + 1),
-        Direction::NegZ => BlockPos::new(pos.x, pos.y, pos.z - 1),
+        Direction::PosX if x + 1 < CHUNK_SIZE => chunk.get_block(x + 1, y, z),
+        Direction::NegX if x > 0 => chunk.get_block(x - 1, y, z),
+        Direction::PosY if y + 1 < CHUNK_SIZE => chunk.get_block(x, y + 1, z),
+        Direction::NegY if y > 0 => chunk.get_block(x, y - 1, z),
+        Direction::PosZ if z + 1 < CHUNK_SIZE => chunk.get_block(x, y, z + 1),
+        Direction::NegZ if z > 0 => chunk.get_block(x, y, z - 1),
+        Direction::PosX => neighbor_chunk_block(world, coord.offset(1, 0, 0), 0, y, z),
+        Direction::NegX => {
+            neighbor_chunk_block(world, coord.offset(-1, 0, 0), CHUNK_SIZE - 1, y, z)
+        }
+        Direction::PosY => neighbor_chunk_block(world, coord.offset(0, 1, 0), x, 0, z),
+        Direction::NegY => {
+            neighbor_chunk_block(world, coord.offset(0, -1, 0), x, CHUNK_SIZE - 1, z)
+        }
+        Direction::PosZ => neighbor_chunk_block(world, coord.offset(0, 0, 1), x, y, 0),
+        Direction::NegZ => {
+            neighbor_chunk_block(world, coord.offset(0, 0, -1), x, y, CHUNK_SIZE - 1)
+        }
     }
+}
+
+fn neighbor_chunk_block(
+    world: &VoxelWorld,
+    coord: ChunkCoord,
+    x: usize,
+    y: usize,
+    z: usize,
+) -> BlockId {
+    world
+        .get_chunk(coord)
+        .map(|chunk| chunk.get_block(x, y, z))
+        .unwrap_or(AIR_BLOCK)
 }
 
 fn add_face(mesh: &mut MeshData, pos: BlockPos, dir: Direction, block_id: BlockId) {

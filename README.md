@@ -26,3 +26,11 @@ Install:
    - `rust-analyzer`
    - `CodeLLDB` or Microsoft C++ tools for debugging
    - `crates` or `Even Better TOML` optionally
+
+## Run
+
+```text
+cargo run -p client -- --fps-window
+cargo run -p client -- --fps-window --no-vsync
+cargo run -p client -- --no-window
+```

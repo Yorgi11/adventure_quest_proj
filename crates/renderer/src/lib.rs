@@ -11,6 +11,31 @@ use winit::{dpi::PhysicalSize, window::Window};
 pub type RendererResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RendererOptions {
+    pub vsync: bool,
+}
+
+impl RendererOptions {
+    pub const fn new(vsync: bool) -> Self {
+        Self { vsync }
+    }
+
+    const fn present_mode(self) -> wgpu::PresentMode {
+        if self.vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        }
+    }
+}
+
+impl Default for RendererOptions {
+    fn default() -> Self {
+        Self { vsync: true }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderFrameStatus {
     Rendered,
     Skipped,
@@ -31,6 +56,7 @@ pub struct VoxelRenderer {
     render_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_text: Option<String>,
+    crosshair_enabled: bool,
     overlay_vertex_buffer: Option<wgpu::Buffer>,
     overlay_vertex_count: u32,
     chunk_meshes: Vec<GpuChunkMesh>,
@@ -133,6 +159,13 @@ impl VoxelCamera {
 
 impl VoxelRenderer {
     pub async fn new(window: Arc<Window>) -> RendererResult<Self> {
+        Self::new_with_options(window, RendererOptions::default()).await
+    }
+
+    pub async fn new_with_options(
+        window: Arc<Window>,
+        options: RendererOptions,
+    ) -> RendererResult<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window)?;
@@ -159,6 +192,10 @@ impl VoxelRenderer {
         let config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or(RendererInitError::NoSupportedSurfaceConfig)?;
+        let config = wgpu::SurfaceConfiguration {
+            present_mode: options.present_mode(),
+            ..config
+        };
 
         surface.configure(&device, &config);
 
@@ -311,6 +348,7 @@ impl VoxelRenderer {
             render_pipeline,
             overlay_pipeline,
             overlay_text: None,
+            crosshair_enabled: false,
             overlay_vertex_buffer: None,
             overlay_vertex_count: 0,
             chunk_meshes: Vec::new(),
@@ -427,6 +465,11 @@ impl VoxelRenderer {
         self.rebuild_overlay_buffer();
     }
 
+    pub fn set_crosshair_enabled(&mut self, enabled: bool) {
+        self.crosshair_enabled = enabled;
+        self.rebuild_overlay_buffer();
+    }
+
     pub fn mesh_count(&self) -> usize {
         self.chunk_meshes.len()
     }
@@ -468,13 +511,19 @@ impl VoxelRenderer {
     }
 
     fn rebuild_overlay_buffer(&mut self) {
-        let Some(text) = self.overlay_text.as_deref() else {
-            self.overlay_vertex_buffer = None;
-            self.overlay_vertex_count = 0;
-            return;
-        };
+        let mut vertices = Vec::new();
 
-        let vertices = build_text_vertices(text, self.config.width, self.config.height);
+        if let Some(text) = self.overlay_text.as_deref() {
+            vertices.extend(build_text_vertices(
+                text,
+                self.config.width,
+                self.config.height,
+            ));
+        }
+
+        if self.crosshair_enabled {
+            push_crosshair_vertices(&mut vertices, self.config.width, self.config.height);
+        }
 
         if vertices.is_empty() {
             self.overlay_vertex_buffer = None;
@@ -916,7 +965,7 @@ fn build_text_vertices(text: &str, width: u32, height: u32) -> Vec<OverlayVertex
                     if pixel == b'#' {
                         let x0 = cursor_x + column as f32 * SCALE;
                         let y0 = ORIGIN_Y + row as f32 * SCALE;
-                        push_overlay_quad(&mut vertices, x0, y0, SCALE, width, height);
+                        push_overlay_square(&mut vertices, x0, y0, SCALE, width, height);
                     }
                 }
             }
@@ -928,7 +977,60 @@ fn build_text_vertices(text: &str, width: u32, height: u32) -> Vec<OverlayVertex
     vertices
 }
 
-fn push_overlay_quad(
+fn push_crosshair_vertices(vertices: &mut Vec<OverlayVertex>, width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    const LENGTH: f32 = 9.0;
+    const GAP: f32 = 4.0;
+    const THICKNESS: f32 = 2.0;
+
+    let width = width as f32;
+    let height = height as f32;
+    let center_x = width * 0.5;
+    let center_y = height * 0.5;
+    let half_thickness = THICKNESS * 0.5;
+
+    push_overlay_rect(
+        vertices,
+        center_x - GAP - LENGTH,
+        center_y - half_thickness,
+        LENGTH,
+        THICKNESS,
+        width,
+        height,
+    );
+    push_overlay_rect(
+        vertices,
+        center_x + GAP,
+        center_y - half_thickness,
+        LENGTH,
+        THICKNESS,
+        width,
+        height,
+    );
+    push_overlay_rect(
+        vertices,
+        center_x - half_thickness,
+        center_y - GAP - LENGTH,
+        THICKNESS,
+        LENGTH,
+        width,
+        height,
+    );
+    push_overlay_rect(
+        vertices,
+        center_x - half_thickness,
+        center_y + GAP,
+        THICKNESS,
+        LENGTH,
+        width,
+        height,
+    );
+}
+
+fn push_overlay_square(
     vertices: &mut Vec<OverlayVertex>,
     x: f32,
     y: f32,
@@ -936,8 +1038,20 @@ fn push_overlay_quad(
     width: f32,
     height: f32,
 ) {
-    let x1 = x + size;
-    let y1 = y + size;
+    push_overlay_rect(vertices, x, y, size, size, width, height);
+}
+
+fn push_overlay_rect(
+    vertices: &mut Vec<OverlayVertex>,
+    x: f32,
+    y: f32,
+    rect_width: f32,
+    rect_height: f32,
+    width: f32,
+    height: f32,
+) {
+    let x1 = x + rect_width;
+    let y1 = y + rect_height;
 
     vertices.extend_from_slice(&[
         OverlayVertex::new(x, y, width, height),
@@ -1111,5 +1225,36 @@ mod tests {
         assert!(!frustum.intersects_aabb(chunk_bounds(ChunkCoord::new(-2, 0, 0))));
         assert!(!frustum.intersects_aabb(chunk_bounds(ChunkCoord::new(4, 0, 0))));
         assert!(!frustum.intersects_aabb(chunk_bounds(ChunkCoord::new(1, 0, 4))));
+    }
+
+    #[test]
+    fn crosshair_builds_four_overlay_rectangles() {
+        let mut vertices = Vec::new();
+
+        push_crosshair_vertices(&mut vertices, 1280, 720);
+
+        assert_eq!(vertices.len(), 24);
+    }
+
+    #[test]
+    fn crosshair_ignores_zero_sized_surface() {
+        let mut vertices = Vec::new();
+
+        push_crosshair_vertices(&mut vertices, 0, 720);
+        push_crosshair_vertices(&mut vertices, 1280, 0);
+
+        assert!(vertices.is_empty());
+    }
+
+    #[test]
+    fn renderer_options_select_expected_present_mode() {
+        assert_eq!(
+            RendererOptions::default().present_mode(),
+            wgpu::PresentMode::AutoVsync
+        );
+        assert_eq!(
+            RendererOptions::new(false).present_mode(),
+            wgpu::PresentMode::AutoNoVsync
+        );
     }
 }
