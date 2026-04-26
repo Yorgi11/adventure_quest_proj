@@ -56,7 +56,7 @@ fn run_window(options: ClientOptions) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ClientOptions {
     no_window: bool,
     show_fps: bool,
@@ -84,18 +84,9 @@ impl ClientOptions {
     }
 }
 
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            no_window: false,
-            show_fps: false,
-            renderer: RendererOptions::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum AppScreen {
+    #[default]
     MainMenu,
     WorldList,
     Settings,
@@ -1324,9 +1315,7 @@ fn push_unique_chunk_coord(coords: &mut Vec<ChunkCoord>, coord: ChunkCoord) {
 fn mark_streamed_chunk_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> Vec<ChunkCoord> {
     let mut dirty_coords = Vec::new();
 
-    for dirty_coord in [coord]
-        .into_iter()
-        .chain(neighbor_chunk_coords(coord).into_iter())
+    for dirty_coord in [coord].into_iter().chain(neighbor_chunk_coords(coord))
     {
         if mark_all_subchunks_dirty(world, dirty_coord) {
             dirty_coords.push(dirty_coord);
@@ -2078,6 +2067,7 @@ enum MeshJobPriority {
     Priority,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ChunkJob {
     Generate {
         seed: u64,
@@ -2157,7 +2147,7 @@ impl ChunkStreamingState {
         }
 
         self.center_chunk = Some(center);
-        self.pending_loads = streaming_chunk_coords(center, self.settings).into();
+        self.pending_loads = streaming_chunk_coords(center, self.settings);
         true
     }
 
@@ -2318,7 +2308,7 @@ fn build_window_meshes(world: &mut VoxelWorld) -> Vec<WindowChunkMesh> {
     let mut meshes = Vec::new();
 
     for coord in coords {
-        let Some(mesh) = mesh_chunk(&world, coord) else {
+        let Some(mesh) = mesh_chunk(world, coord) else {
             continue;
         };
 
@@ -2731,8 +2721,7 @@ mod tests {
 
     #[test]
     fn horizontal_movement_uses_camera_yaw() {
-        let mut input = InputState::default();
-        input.forward = true;
+        let mut input = InputState { forward: true, ..Default::default() };
 
         assert_eq!(horizontal_movement(0.0, input), (1.0, 0.0));
 

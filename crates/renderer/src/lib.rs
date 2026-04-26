@@ -1048,6 +1048,7 @@ fn build_text_vertices(text: &str, width: u32, height: u32) -> Vec<OverlayVertex
     vertices
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_text_vertices(
     vertices: &mut Vec<OverlayVertex>,
     text: &str,
@@ -1161,6 +1162,7 @@ fn push_overlay_square(
     push_overlay_rect(vertices, x, y, size, size, color, width, height);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_overlay_rect(
     vertices: &mut Vec<OverlayVertex>,
     x: f32,
