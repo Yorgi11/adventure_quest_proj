@@ -88,13 +88,29 @@ impl VoxelWorld {
         }
     }
 
+    pub fn generate_chunk(seed: u64, coord: ChunkCoord) -> Chunk {
+        WorldGenerator::new(seed).generate_chunk(coord)
+    }
+
+    pub const fn seed(&self) -> u64 {
+        self.generator.seed
+    }
+
     pub fn load_chunk(&mut self, coord: ChunkCoord) -> bool {
         if self.chunks.contains_key(&coord) {
             return false;
         }
 
-        let chunk = self.generator.generate_chunk(coord);
-        self.chunks.insert(coord, chunk);
+        let chunk = Self::generate_chunk(self.seed(), coord);
+        self.insert_chunk(chunk)
+    }
+
+    pub fn insert_chunk(&mut self, chunk: Chunk) -> bool {
+        if self.chunks.contains_key(&chunk.coord) {
+            return false;
+        }
+
+        self.chunks.insert(chunk.coord, chunk);
         true
     }
 
@@ -345,6 +361,24 @@ mod tests {
 
         assert_eq!(world.get_block(pos), STONE_BLOCK);
         assert!(world.get_chunk(ChunkCoord::new(0, 0, 0)).is_some());
+    }
+
+    #[test]
+    fn inserting_existing_chunk_reports_no_change() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_empty_chunk(coord);
+
+        assert!(!world.insert_chunk(Chunk::new_empty(coord)));
+        assert_eq!(world.chunks.len(), 1);
+    }
+
+    #[test]
+    fn generated_chunk_uses_requested_seed_and_coord() {
+        let coord = ChunkCoord::new(2, -1, 3);
+        let chunk = VoxelWorld::generate_chunk(123, coord);
+
+        assert_eq!(chunk.coord, coord);
+        assert_eq!(VoxelWorld::new(123).seed(), 123);
     }
 
     #[test]

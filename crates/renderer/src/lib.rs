@@ -55,6 +55,7 @@ pub struct VoxelRenderer {
     camera: VoxelCamera,
     render_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
+    ui_overlay: UiOverlay,
     overlay_text: Option<String>,
     crosshair_enabled: bool,
     overlay_vertex_buffer: Option<wgpu::Buffer>,
@@ -87,6 +88,59 @@ pub struct RenderFrameStats {
     pub drawn_chunk_meshes: usize,
     pub culled_chunk_meshes: usize,
     pub drawn_indices: u32,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct UiOverlay {
+    pub items: Vec<UiOverlayItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiOverlayItem {
+    Rect(UiRect),
+    Text(UiText),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub color: [f32; 4],
+}
+
+impl UiRect {
+    pub const fn new(x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            color,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiText {
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
+    pub color: [f32; 4],
+    pub text: String,
+}
+
+impl UiText {
+    pub fn new(x: f32, y: f32, scale: f32, color: [f32; 4], text: impl Into<String>) -> Self {
+        Self {
+            x,
+            y,
+            scale,
+            color,
+            text: text.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -347,6 +401,7 @@ impl VoxelRenderer {
             camera,
             render_pipeline,
             overlay_pipeline,
+            ui_overlay: UiOverlay::default(),
             overlay_text: None,
             crosshair_enabled: false,
             overlay_vertex_buffer: None,
@@ -426,6 +481,10 @@ impl VoxelRenderer {
             .collect();
     }
 
+    pub fn clear_chunk_meshes(&mut self) {
+        self.chunk_meshes.clear();
+    }
+
     pub fn remove_chunk_mesh(&mut self, coord: ChunkCoord) -> bool {
         let Some(index) = self
             .chunk_meshes
@@ -462,6 +521,11 @@ impl VoxelRenderer {
 
     pub fn set_overlay_text(&mut self, text: Option<String>) {
         self.overlay_text = text;
+        self.rebuild_overlay_buffer();
+    }
+
+    pub fn set_ui_overlay(&mut self, overlay: UiOverlay) {
+        self.ui_overlay = overlay;
         self.rebuild_overlay_buffer();
     }
 
@@ -512,6 +576,31 @@ impl VoxelRenderer {
 
     fn rebuild_overlay_buffer(&mut self) {
         let mut vertices = Vec::new();
+
+        for item in &self.ui_overlay.items {
+            match item {
+                UiOverlayItem::Rect(rect) => push_overlay_rect(
+                    &mut vertices,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    rect.color,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                ),
+                UiOverlayItem::Text(text) => push_text_vertices(
+                    &mut vertices,
+                    &text.text,
+                    text.x,
+                    text.y,
+                    text.scale,
+                    text.color,
+                    self.config.width,
+                    self.config.height,
+                ),
+            }
+        }
 
         if let Some(text) = self.overlay_text.as_deref() {
             vertices.extend(build_text_vertices(
@@ -653,10 +742,10 @@ struct OverlayVertex {
 }
 
 impl OverlayVertex {
-    fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+    fn new(x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) -> Self {
         Self {
             position: [(x / width) * 2.0 - 1.0, 1.0 - (y / height) * 2.0],
-            color: [1.0, 1.0, 1.0, 1.0],
+            color,
         }
     }
 
@@ -938,43 +1027,68 @@ fn block_color(block_id: u16) -> [f32; 3] {
 }
 
 fn build_text_vertices(text: &str, width: u32, height: u32) -> Vec<OverlayVertex> {
-    if width == 0 || height == 0 {
-        return Vec::new();
+    const SCALE: f32 = 2.0;
+    const ORIGIN_X: f32 = 12.0;
+    const ORIGIN_Y: f32 = 12.0;
+    const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+    let mut vertices = Vec::new();
+
+    push_text_vertices(
+        &mut vertices,
+        text,
+        ORIGIN_X,
+        ORIGIN_Y,
+        SCALE,
+        WHITE,
+        width,
+        height,
+    );
+
+    vertices
+}
+
+fn push_text_vertices(
+    vertices: &mut Vec<OverlayVertex>,
+    text: &str,
+    x: f32,
+    y: f32,
+    scale: f32,
+    color: [f32; 4],
+    width: u32,
+    height: u32,
+) {
+    if width == 0 || height == 0 || scale <= 0.0 {
+        return;
     }
 
     const GLYPH_WIDTH: usize = 5;
     const GLYPH_HEIGHT: usize = 7;
-    const SCALE: f32 = 2.0;
-    const ORIGIN_X: f32 = 12.0;
-    const ORIGIN_Y: f32 = 12.0;
 
     let width = width as f32;
     let height = height as f32;
-    let mut vertices = Vec::new();
-    let mut cursor_x = ORIGIN_X;
+    let mut cursor_x = x;
 
     for character in text.chars() {
         if character == ' ' {
-            cursor_x += SCALE * 4.0;
+            cursor_x += scale * 4.0;
             continue;
         }
 
-        if let Some(pattern) = glyph_pattern(character) {
+        if let Some(pattern) = glyph_pattern(character.to_ascii_uppercase()) {
             for (row, line) in pattern.iter().enumerate().take(GLYPH_HEIGHT) {
                 for (column, pixel) in line.bytes().enumerate().take(GLYPH_WIDTH) {
                     if pixel == b'#' {
-                        let x0 = cursor_x + column as f32 * SCALE;
-                        let y0 = ORIGIN_Y + row as f32 * SCALE;
-                        push_overlay_square(&mut vertices, x0, y0, SCALE, width, height);
+                        let x0 = cursor_x + column as f32 * scale;
+                        let y0 = y + row as f32 * scale;
+                        push_overlay_square(vertices, x0, y0, scale, color, width, height);
                     }
                 }
             }
         }
 
-        cursor_x += SCALE * (GLYPH_WIDTH as f32 + 1.0);
+        cursor_x += scale * (GLYPH_WIDTH as f32 + 1.0);
     }
-
-    vertices
 }
 
 fn push_crosshair_vertices(vertices: &mut Vec<OverlayVertex>, width: u32, height: u32) {
@@ -991,6 +1105,7 @@ fn push_crosshair_vertices(vertices: &mut Vec<OverlayVertex>, width: u32, height
     let center_x = width * 0.5;
     let center_y = height * 0.5;
     let half_thickness = THICKNESS * 0.5;
+    let color = [1.0, 1.0, 1.0, 1.0];
 
     push_overlay_rect(
         vertices,
@@ -998,6 +1113,7 @@ fn push_crosshair_vertices(vertices: &mut Vec<OverlayVertex>, width: u32, height
         center_y - half_thickness,
         LENGTH,
         THICKNESS,
+        color,
         width,
         height,
     );
@@ -1007,6 +1123,7 @@ fn push_crosshair_vertices(vertices: &mut Vec<OverlayVertex>, width: u32, height
         center_y - half_thickness,
         LENGTH,
         THICKNESS,
+        color,
         width,
         height,
     );
@@ -1016,6 +1133,7 @@ fn push_crosshair_vertices(vertices: &mut Vec<OverlayVertex>, width: u32, height
         center_y - GAP - LENGTH,
         THICKNESS,
         LENGTH,
+        color,
         width,
         height,
     );
@@ -1025,6 +1143,7 @@ fn push_crosshair_vertices(vertices: &mut Vec<OverlayVertex>, width: u32, height
         center_y + GAP,
         THICKNESS,
         LENGTH,
+        color,
         width,
         height,
     );
@@ -1035,10 +1154,11 @@ fn push_overlay_square(
     x: f32,
     y: f32,
     size: f32,
+    color: [f32; 4],
     width: f32,
     height: f32,
 ) {
-    push_overlay_rect(vertices, x, y, size, size, width, height);
+    push_overlay_rect(vertices, x, y, size, size, color, width, height);
 }
 
 fn push_overlay_rect(
@@ -1047,32 +1167,106 @@ fn push_overlay_rect(
     y: f32,
     rect_width: f32,
     rect_height: f32,
+    color: [f32; 4],
     width: f32,
     height: f32,
 ) {
+    if width <= 0.0 || height <= 0.0 || rect_width <= 0.0 || rect_height <= 0.0 {
+        return;
+    }
+
     let x1 = x + rect_width;
     let y1 = y + rect_height;
 
     vertices.extend_from_slice(&[
-        OverlayVertex::new(x, y, width, height),
-        OverlayVertex::new(x1, y, width, height),
-        OverlayVertex::new(x1, y1, width, height),
-        OverlayVertex::new(x, y, width, height),
-        OverlayVertex::new(x1, y1, width, height),
-        OverlayVertex::new(x, y1, width, height),
+        OverlayVertex::new(x, y, width, height, color),
+        OverlayVertex::new(x1, y, width, height, color),
+        OverlayVertex::new(x1, y1, width, height, color),
+        OverlayVertex::new(x, y, width, height, color),
+        OverlayVertex::new(x1, y1, width, height, color),
+        OverlayVertex::new(x, y1, width, height, color),
     ]);
 }
 
 fn glyph_pattern(character: char) -> Option<[&'static str; 7]> {
     match character {
+        'A' => Some([
+            ".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#",
+        ]),
+        'B' => Some([
+            "####.", "#...#", "#...#", "####.", "#...#", "#...#", "####.",
+        ]),
+        'C' => Some([
+            ".####", "#....", "#....", "#....", "#....", "#....", ".####",
+        ]),
+        'D' => Some([
+            "####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####.",
+        ]),
+        'E' => Some([
+            "#####", "#....", "#....", "####.", "#....", "#....", "#####",
+        ]),
         'F' => Some([
             "#####", "#....", "#....", "####.", "#....", "#....", "#....",
+        ]),
+        'G' => Some([
+            ".####", "#....", "#....", "#.###", "#...#", "#...#", ".####",
+        ]),
+        'H' => Some([
+            "#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#",
+        ]),
+        'I' => Some([
+            "#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####",
+        ]),
+        'J' => Some([
+            "..###", "...#.", "...#.", "...#.", "#..#.", "#..#.", ".##..",
+        ]),
+        'K' => Some([
+            "#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#",
+        ]),
+        'L' => Some([
+            "#....", "#....", "#....", "#....", "#....", "#....", "#####",
+        ]),
+        'M' => Some([
+            "#...#", "##.##", "#.#.#", "#...#", "#...#", "#...#", "#...#",
+        ]),
+        'N' => Some([
+            "#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#",
+        ]),
+        'O' => Some([
+            ".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###.",
         ]),
         'P' => Some([
             "####.", "#...#", "#...#", "####.", "#....", "#....", "#....",
         ]),
+        'Q' => Some([
+            ".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#",
+        ]),
+        'R' => Some([
+            "####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#",
+        ]),
         'S' => Some([
             "#####", "#....", "#....", "#####", "....#", "....#", "#####",
+        ]),
+        'T' => Some([
+            "#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#..",
+        ]),
+        'U' => Some([
+            "#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###.",
+        ]),
+        'V' => Some([
+            "#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#..",
+        ]),
+        'W' => Some([
+            "#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#",
+        ]),
+        'X' => Some([
+            "#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#",
+        ]),
+        'Y' => Some([
+            "#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#..",
+        ]),
+        'Z' => Some([
+            "#####", "....#", "...#.", "..#..", ".#...", "#....", "#####",
         ]),
         '0' => Some([
             "#####", "#...#", "#..##", "#.#.#", "##..#", "#...#", "#####",
@@ -1103,6 +1297,9 @@ fn glyph_pattern(character: char) -> Option<[&'static str; 7]> {
         ]),
         '9' => Some([
             "#####", "#...#", "#...#", "#####", "....#", "....#", "#####",
+        ]),
+        '.' => Some([
+            ".....", ".....", ".....", ".....", ".....", "..#..", "..#..",
         ]),
         _ => None,
     }

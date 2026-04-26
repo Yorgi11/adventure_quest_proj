@@ -1,7 +1,9 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     error::Error,
+    sync::mpsc::{self, Receiver, Sender},
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -9,14 +11,17 @@ use foundation::{BlockPos, ChunkCoord};
 use gameplay::{
     break_target_block, place_selected_block, BlockInteraction, Hotbar, HOTBAR_SLOT_COUNT,
 };
-use meshing::{mesh_chunk, mesh_dirty_subchunks, MeshData};
+use meshing::{mesh_chunk, mesh_chunk_input, mesh_dirty_subchunks, ChunkMeshInput, MeshData};
 use physics::{move_aabb_through_voxels, raycast_blocks};
-use renderer::{ChunkMeshUpload, ClearRenderer, RendererOptions, VoxelCamera};
-use voxels::{world_to_chunk_coord, SUBCHUNK_COUNT};
+use renderer::{
+    ChunkMeshUpload, ClearRenderer, RendererOptions, UiOverlay, UiOverlayItem, UiRect, UiText,
+    VoxelCamera,
+};
+use voxels::{world_to_chunk_coord, Chunk, SUBCHUNK_COUNT};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
-    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
+    event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
@@ -82,9 +87,78 @@ impl Default for ClientOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppScreen {
+    MainMenu,
+    WorldList,
+    Settings,
+    PauseMenu,
+    InGame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    Play,
+    Settings,
+    CreateWorld,
+    Back,
+    Resume,
+    QuitToMenu,
+    QuitGame,
+    MouseSensitivity,
+    ChunkViewDistance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsField {
+    MouseSensitivity,
+    ChunkViewDistance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GameSettings {
+    mouse_sensitivity: f32,
+    chunk_view_distance: i32,
+}
+
+impl GameSettings {
+    fn streaming_settings(self) -> WorldStreamingSettings {
+        let radius = self
+            .chunk_view_distance
+            .clamp(MIN_CHUNK_VIEW_DISTANCE, MAX_CHUNK_VIEW_DISTANCE);
+
+        WorldStreamingSettings::new(radius, radius, radius, radius, radius, radius + 1)
+    }
+}
+
+impl Default for GameSettings {
+    fn default() -> Self {
+        Self {
+            mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
+            chunk_view_distance: DEFAULT_CHUNK_VIEW_DISTANCE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsInputs {
+    mouse_sensitivity: String,
+    chunk_view_distance: String,
+}
+
+impl SettingsInputs {
+    fn from_settings(settings: GameSettings) -> Self {
+        Self {
+            mouse_sensitivity: format!("{:.4}", settings.mouse_sensitivity),
+            chunk_view_distance: settings.chunk_view_distance.to_string(),
+        }
+    }
+}
+
 struct AdventureQuestApp {
     window: Option<Arc<Window>>,
     renderer: Option<ClearRenderer>,
+    screen: AppScreen,
     input: InputState,
     camera: VoxelCamera,
     last_frame: Option<Instant>,
@@ -96,8 +170,14 @@ struct AdventureQuestApp {
     hotbar: Hotbar,
     noclip_enabled: bool,
     mouse_look_active: bool,
+    mouse_position: PhysicalPosition<f64>,
+    settings: GameSettings,
+    settings_inputs: SettingsInputs,
+    active_settings_field: Option<SettingsField>,
+    settings_back_screen: AppScreen,
     dirty_mesh_queue: DirtyMeshQueue,
     streaming: ChunkStreamingState,
+    chunk_jobs: ChunkJobQueue,
 }
 
 impl AdventureQuestApp {
@@ -105,6 +185,7 @@ impl AdventureQuestApp {
         Self {
             window: None,
             renderer: None,
+            screen: AppScreen::MainMenu,
             input: InputState::default(),
             camera: VoxelCamera::looking_at_chunk_origin(),
             last_frame: None,
@@ -116,8 +197,14 @@ impl AdventureQuestApp {
             hotbar: Hotbar::starter(),
             noclip_enabled: false,
             mouse_look_active: false,
+            mouse_position: PhysicalPosition::new(0.0, 0.0),
+            settings: GameSettings::default(),
+            settings_inputs: SettingsInputs::from_settings(GameSettings::default()),
+            active_settings_field: None,
+            settings_back_screen: AppScreen::MainMenu,
             dirty_mesh_queue: DirtyMeshQueue::default(),
             streaming: ChunkStreamingState::default(),
+            chunk_jobs: ChunkJobQueue::default(),
         }
     }
 }
@@ -141,9 +228,6 @@ impl ApplicationHandler for AdventureQuestApp {
             }
         };
 
-        window.focus_window();
-        self.capture_mouse(&window);
-
         let mut renderer = match pollster::block_on(ClearRenderer::new_with_options(
             window.clone(),
             self.renderer_options,
@@ -157,25 +241,20 @@ impl ApplicationHandler for AdventureQuestApp {
         };
 
         renderer.set_camera(self.camera);
-        renderer.set_crosshair_enabled(true);
+        renderer.set_crosshair_enabled(false);
         if self.show_fps {
             renderer.set_fps_overlay(Some(0));
         }
+        renderer.set_ui_overlay(
+            build_menu_layout(
+                self.screen,
+                &self.settings_inputs,
+                self.active_settings_field,
+                renderer.size(),
+            )
+            .overlay,
+        );
 
-        let window_world = build_window_world();
-
-        if window_world.meshes.is_empty() {
-            eprintln!("No chunk meshes were available for the first rendered frame");
-        } else {
-            renderer.upload_chunk_meshes(window_world.meshes.iter().map(WindowChunkMesh::upload));
-            println!(
-                "Uploaded {} chunk meshes to renderer ({} indices)",
-                renderer.mesh_count(),
-                renderer.index_count()
-            );
-        }
-
-        self.world = Some(window_world.world);
         self.renderer = Some(renderer);
         self.window = Some(window.clone());
         window.request_redraw();
@@ -212,19 +291,27 @@ impl ApplicationHandler for AdventureQuestApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(focused) => {
                 if focused {
-                    self.capture_mouse(&window);
+                    if self.screen == AppScreen::InGame {
+                        self.capture_mouse(&window);
+                    }
                 } else {
-                    self.mouse_look_active = false;
-                    window.set_cursor_visible(true);
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                    self.release_mouse(&window);
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_position = position;
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                if self.screen != AppScreen::InGame {
+                    self.handle_menu_keyboard(event_loop, &window, &event);
+                    return;
+                }
+
                 if let PhysicalKey::Code(key) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
 
                     if key == KeyCode::Escape && pressed {
-                        event_loop.exit();
+                        self.open_pause_menu(&window);
                     } else if key == KeyCode::KeyV && pressed {
                         self.toggle_noclip();
                     } else if pressed && self.select_hotbar_key(key) {
@@ -238,23 +325,33 @@ impl ApplicationHandler for AdventureQuestApp {
                 button,
                 ..
             } => {
-                self.capture_mouse(&window);
+                if self.screen == AppScreen::InGame {
+                    self.capture_mouse(&window);
 
-                match button {
-                    MouseButton::Left => self.interact_with_target(BlockAction::Break),
-                    MouseButton::Right => self.interact_with_target(BlockAction::Place),
-                    _ => {}
+                    match button {
+                        MouseButton::Left => self.interact_with_target(BlockAction::Break),
+                        MouseButton::Right => self.interact_with_target(BlockAction::Place),
+                        _ => {}
+                    }
+                } else if button == MouseButton::Left {
+                    self.handle_menu_click(event_loop, &window);
                 }
             }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }
+                self.refresh_menu_overlay();
             }
             WindowEvent::RedrawRequested => {
-                self.advance_player();
-                self.process_chunk_streaming();
-                self.process_dirty_mesh_queue();
+                if self.screen == AppScreen::InGame {
+                    self.advance_player();
+                    self.process_completed_chunk_jobs();
+                    self.process_chunk_streaming();
+                    self.schedule_dirty_mesh_jobs();
+                } else {
+                    self.last_frame = None;
+                }
 
                 let fps_update = if self.show_fps {
                     self.fps_counter.record_frame(Instant::now())
@@ -322,18 +419,17 @@ impl AdventureQuestApp {
     }
 
     fn apply_mouse_look(&mut self, delta: (f64, f64)) {
-        if !self.mouse_look_active {
+        if self.screen != AppScreen::InGame || !self.mouse_look_active {
             return;
         }
 
-        let yaw = delta.0 as f32 * MOUSE_SENSITIVITY;
-        let pitch = -(delta.1 as f32) * MOUSE_SENSITIVITY;
+        let yaw = delta.0 as f32 * self.settings.mouse_sensitivity;
+        let pitch = -(delta.1 as f32) * self.settings.mouse_sensitivity;
 
         self.camera.rotate(yaw, pitch);
     }
 
     fn capture_mouse(&mut self, window: &Window) {
-        window.focus_window();
         let _ = window.set_cursor_position(window_center_position(window.inner_size()));
         window.set_cursor_visible(false);
 
@@ -350,6 +446,343 @@ impl AdventureQuestApp {
                 window.set_cursor_visible(true);
                 eprintln!("Mouse capture unavailable: {error}");
             }
+        }
+    }
+
+    fn release_mouse(&mut self, window: &Window) {
+        self.mouse_look_active = false;
+        window.set_cursor_visible(true);
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+    }
+
+    fn handle_menu_click(&mut self, event_loop: &ActiveEventLoop, window: &Window) {
+        let Some(size) = self.renderer.as_ref().map(ClearRenderer::size) else {
+            return;
+        };
+        let layout = build_menu_layout(
+            self.screen,
+            &self.settings_inputs,
+            self.active_settings_field,
+            size,
+        );
+
+        let Some(action) = layout
+            .hits
+            .iter()
+            .find(|hit| hit.rect.contains(self.mouse_position))
+            .map(|hit| hit.action)
+        else {
+            if self.screen == AppScreen::Settings {
+                self.active_settings_field = None;
+                self.refresh_menu_overlay();
+            }
+            return;
+        };
+
+        match action {
+            MenuAction::Play => {
+                self.screen = AppScreen::WorldList;
+                self.active_settings_field = None;
+                self.release_mouse(window);
+                self.refresh_menu_overlay();
+            }
+            MenuAction::Settings => {
+                self.settings_back_screen = if self.screen == AppScreen::PauseMenu {
+                    AppScreen::PauseMenu
+                } else {
+                    AppScreen::MainMenu
+                };
+                self.screen = AppScreen::Settings;
+                self.settings_inputs = SettingsInputs::from_settings(self.settings);
+                self.active_settings_field = Some(SettingsField::MouseSensitivity);
+                self.release_mouse(window);
+                self.refresh_menu_overlay();
+            }
+            MenuAction::CreateWorld => {
+                self.apply_settings_from_inputs();
+                self.start_existing_world(window);
+            }
+            MenuAction::Back => {
+                if self.screen == AppScreen::Settings {
+                    self.apply_settings_from_inputs();
+                    self.screen = self.settings_back_screen;
+                } else {
+                    self.screen = AppScreen::MainMenu;
+                }
+                self.active_settings_field = None;
+                self.release_mouse(window);
+                self.refresh_menu_overlay();
+            }
+            MenuAction::Resume => {
+                self.resume_game(window);
+            }
+            MenuAction::QuitToMenu => {
+                self.quit_to_main_menu(window);
+            }
+            MenuAction::QuitGame => {
+                event_loop.exit();
+            }
+            MenuAction::MouseSensitivity => {
+                self.active_settings_field = Some(SettingsField::MouseSensitivity);
+                self.refresh_menu_overlay();
+            }
+            MenuAction::ChunkViewDistance => {
+                self.active_settings_field = Some(SettingsField::ChunkViewDistance);
+                self.refresh_menu_overlay();
+            }
+        }
+    }
+
+    fn handle_menu_keyboard(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window: &Window,
+        event: &KeyEvent,
+    ) {
+        let pressed = event.state == ElementState::Pressed;
+
+        if self.screen == AppScreen::Settings && self.handle_settings_keyboard(event) {
+            self.refresh_menu_overlay();
+            return;
+        }
+
+        if !pressed {
+            return;
+        }
+
+        let PhysicalKey::Code(key) = event.physical_key else {
+            return;
+        };
+
+        if key != KeyCode::Escape {
+            return;
+        }
+
+        match self.screen {
+            AppScreen::MainMenu => {}
+            AppScreen::PauseMenu => self.resume_game(window),
+            AppScreen::Settings => {
+                self.apply_settings_from_inputs();
+                self.screen = self.settings_back_screen;
+                self.active_settings_field = None;
+                self.refresh_menu_overlay();
+            }
+            AppScreen::WorldList => {
+                self.screen = AppScreen::MainMenu;
+                self.active_settings_field = None;
+                self.refresh_menu_overlay();
+            }
+            AppScreen::InGame => event_loop.exit(),
+        }
+    }
+
+    fn handle_settings_keyboard(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+
+        if let PhysicalKey::Code(key) = event.physical_key {
+            match key {
+                KeyCode::Tab => {
+                    self.active_settings_field = Some(match self.active_settings_field {
+                        Some(SettingsField::MouseSensitivity) => SettingsField::ChunkViewDistance,
+                        _ => SettingsField::MouseSensitivity,
+                    });
+                    return true;
+                }
+                KeyCode::Backspace => {
+                    if let Some(text) = self.active_settings_text_mut() {
+                        text.pop();
+                    }
+                    return true;
+                }
+                KeyCode::Enter => {
+                    self.apply_settings_from_inputs();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(text) = event.text.as_deref() else {
+            return false;
+        };
+
+        self.push_settings_text(text)
+    }
+
+    fn push_settings_text(&mut self, text: &str) -> bool {
+        let Some(field) = self.active_settings_field else {
+            return false;
+        };
+
+        let mut accepted_any = false;
+
+        for character in text.chars() {
+            if !is_settings_character_allowed(field, character) {
+                continue;
+            }
+
+            let Some(target) = self.active_settings_text_mut() else {
+                continue;
+            };
+
+            if field == SettingsField::MouseSensitivity && character == '.' && target.contains('.')
+            {
+                continue;
+            }
+
+            if target.len() >= settings_input_limit(field) {
+                continue;
+            }
+
+            target.push(character);
+            accepted_any = true;
+        }
+
+        accepted_any
+    }
+
+    fn active_settings_text_mut(&mut self) -> Option<&mut String> {
+        match self.active_settings_field {
+            Some(SettingsField::MouseSensitivity) => {
+                Some(&mut self.settings_inputs.mouse_sensitivity)
+            }
+            Some(SettingsField::ChunkViewDistance) => {
+                Some(&mut self.settings_inputs.chunk_view_distance)
+            }
+            None => None,
+        }
+    }
+
+    fn apply_settings_from_inputs(&mut self) {
+        let mouse_sensitivity = self
+            .settings_inputs
+            .mouse_sensitivity
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(self.settings.mouse_sensitivity)
+            .clamp(MIN_MOUSE_SENSITIVITY, MAX_MOUSE_SENSITIVITY);
+        let chunk_view_distance = self
+            .settings_inputs
+            .chunk_view_distance
+            .parse::<i32>()
+            .unwrap_or(self.settings.chunk_view_distance)
+            .clamp(MIN_CHUNK_VIEW_DISTANCE, MAX_CHUNK_VIEW_DISTANCE);
+
+        self.settings = GameSettings {
+            mouse_sensitivity,
+            chunk_view_distance,
+        };
+        self.settings_inputs = SettingsInputs::from_settings(self.settings);
+        self.streaming
+            .set_settings(self.settings.streaming_settings());
+    }
+
+    fn start_existing_world(&mut self, window: &Window) {
+        self.release_mouse(window);
+        self.camera = VoxelCamera::looking_at_chunk_origin();
+        self.player = PlayerController::from_camera(self.camera);
+        self.input = InputState::default();
+        self.last_frame = None;
+        self.noclip_enabled = false;
+        self.dirty_mesh_queue = DirtyMeshQueue::default();
+        self.streaming = ChunkStreamingState::new(self.settings.streaming_settings());
+        self.chunk_jobs = ChunkJobQueue::default();
+
+        let window_world = build_window_world();
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_camera(self.camera);
+            renderer.set_ui_overlay(UiOverlay::default());
+            renderer.set_crosshair_enabled(true);
+            renderer.upload_chunk_meshes(window_world.meshes.iter().map(WindowChunkMesh::upload));
+
+            if window_world.meshes.is_empty() {
+                eprintln!("No chunk meshes were available for the first rendered frame");
+            } else {
+                println!(
+                    "Uploaded {} chunk meshes to renderer ({} indices)",
+                    renderer.mesh_count(),
+                    renderer.index_count()
+                );
+            }
+        }
+
+        self.world = Some(window_world.world);
+        self.screen = AppScreen::InGame;
+        self.capture_mouse(window);
+    }
+
+    fn open_pause_menu(&mut self, window: &Window) {
+        self.input = InputState::default();
+        self.last_frame = None;
+        self.active_settings_field = None;
+        self.screen = AppScreen::PauseMenu;
+        self.release_mouse(window);
+        self.refresh_menu_overlay();
+    }
+
+    fn resume_game(&mut self, window: &Window) {
+        if self.world.is_none() {
+            self.quit_to_main_menu(window);
+            return;
+        }
+
+        self.input = InputState::default();
+        self.last_frame = None;
+        self.active_settings_field = None;
+        self.screen = AppScreen::InGame;
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_ui_overlay(UiOverlay::default());
+            renderer.set_crosshair_enabled(true);
+        }
+
+        self.capture_mouse(window);
+    }
+
+    fn quit_to_main_menu(&mut self, window: &Window) {
+        self.release_mouse(window);
+        self.world = None;
+        self.input = InputState::default();
+        self.last_frame = None;
+        self.noclip_enabled = false;
+        self.active_settings_field = None;
+        self.settings_back_screen = AppScreen::MainMenu;
+        self.dirty_mesh_queue = DirtyMeshQueue::default();
+        self.streaming = ChunkStreamingState::new(self.settings.streaming_settings());
+        self.chunk_jobs = ChunkJobQueue::default();
+        self.screen = AppScreen::MainMenu;
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_chunk_meshes();
+            renderer.set_crosshair_enabled(false);
+        }
+
+        self.refresh_menu_overlay();
+    }
+
+    fn refresh_menu_overlay(&mut self) {
+        if self.screen == AppScreen::InGame {
+            return;
+        }
+
+        let Some(size) = self.renderer.as_ref().map(ClearRenderer::size) else {
+            return;
+        };
+        let overlay = build_menu_layout(
+            self.screen,
+            &self.settings_inputs,
+            self.active_settings_field,
+            size,
+        )
+        .overlay;
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_crosshair_enabled(false);
+            renderer.set_ui_overlay(overlay);
         }
     }
 
@@ -404,7 +837,7 @@ impl AdventureQuestApp {
         self.dirty_mesh_queue.enqueue_dirty(world);
     }
 
-    fn process_dirty_mesh_queue(&mut self) {
+    fn process_completed_chunk_jobs(&mut self) {
         let Some(world) = self.world.as_mut() else {
             return;
         };
@@ -412,14 +845,54 @@ impl AdventureQuestApp {
             return;
         };
 
+        for result in self.chunk_jobs.drain_results() {
+            match result {
+                ChunkJobResult::Generated { coord, chunk } => {
+                    if world.insert_chunk(chunk) {
+                        for dirty_coord in mark_streamed_chunk_dirty(world, coord) {
+                            self.dirty_mesh_queue.enqueue(dirty_coord);
+                        }
+                    }
+                }
+                ChunkJobResult::Meshed {
+                    coord,
+                    revision,
+                    mesh,
+                } => {
+                    apply_mesh_job_result(
+                        world,
+                        renderer,
+                        &mut self.dirty_mesh_queue,
+                        coord,
+                        revision,
+                        mesh,
+                    );
+                }
+            }
+        }
+    }
+
+    fn schedule_dirty_mesh_jobs(&mut self) {
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+
         self.dirty_mesh_queue.enqueue_dirty(world);
 
-        for _ in 0..DIRTY_MESH_UPLOADS_PER_FRAME {
+        for _ in 0..DIRTY_MESH_JOBS_PER_FRAME {
             let Some(coord) = self.dirty_mesh_queue.pop_dirty(world) else {
                 break;
             };
 
-            upload_window_chunk_mesh(world, renderer, coord);
+            if self.chunk_jobs.is_mesh_pending(coord) {
+                continue;
+            }
+
+            let Some(input) = ChunkMeshInput::from_world(world, coord) else {
+                continue;
+            };
+
+            self.chunk_jobs.enqueue_mesh(input);
         }
     }
 
@@ -433,18 +906,18 @@ impl AdventureQuestApp {
             println!("Streaming around chunk {:?}", center);
         }
 
-        for _ in 0..CHUNK_LOADS_PER_FRAME {
+        let seed = world.seed();
+
+        for _ in 0..CHUNK_GENERATION_JOBS_PER_FRAME {
             let Some(coord) = self.streaming.pop_missing(world) else {
                 break;
             };
 
-            if !world.load_chunk(coord) {
+            if self.chunk_jobs.is_generation_pending(coord) {
                 continue;
             }
 
-            for dirty_coord in mark_streamed_chunk_dirty(world, coord) {
-                self.dirty_mesh_queue.enqueue(dirty_coord);
-            }
+            self.chunk_jobs.enqueue_generation(seed, coord);
         }
     }
 }
@@ -533,9 +1006,14 @@ fn mark_all_subchunks_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> bool {
 }
 
 const PLAYER_REACH: f32 = 8.0;
-const MOUSE_SENSITIVITY: f32 = 0.0025;
-const DIRTY_MESH_UPLOADS_PER_FRAME: usize = 1;
-const CHUNK_LOADS_PER_FRAME: usize = 1;
+const DEFAULT_MOUSE_SENSITIVITY: f32 = 0.0025;
+const MIN_MOUSE_SENSITIVITY: f32 = 0.0001;
+const MAX_MOUSE_SENSITIVITY: f32 = 0.05;
+const DEFAULT_CHUNK_VIEW_DISTANCE: i32 = 1;
+const MIN_CHUNK_VIEW_DISTANCE: i32 = 1;
+const MAX_CHUNK_VIEW_DISTANCE: i32 = 3;
+const DIRTY_MESH_JOBS_PER_FRAME: usize = 2;
+const CHUNK_GENERATION_JOBS_PER_FRAME: usize = 1;
 const PLAYER_HALF_EXTENTS: [f32; 3] = [0.3, 0.9, 0.3];
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
 const PLAYER_WALK_SPEED: f32 = 5.5;
@@ -543,6 +1021,382 @@ const PLAYER_SPRINT_SPEED: f32 = 8.5;
 const PLAYER_JUMP_SPEED: f32 = 8.0;
 const PLAYER_GRAVITY: f32 = 24.0;
 const PLAYER_MAX_FALL_SPEED: f32 = 48.0;
+
+#[derive(Debug, Clone)]
+struct MenuLayout {
+    overlay: UiOverlay,
+    hits: Vec<MenuHitRect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MenuHitRect {
+    action: MenuAction,
+    rect: ScreenRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScreenRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl ScreenRect {
+    const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn centered(window_width: f32, y: f32, width: f32, height: f32) -> Self {
+        Self::new((window_width - width) * 0.5, y, width, height)
+    }
+
+    fn contains(self, position: PhysicalPosition<f64>) -> bool {
+        let x = position.x as f32;
+        let y = position.y as f32;
+
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+    }
+}
+
+fn build_menu_layout(
+    screen: AppScreen,
+    settings_inputs: &SettingsInputs,
+    active_field: Option<SettingsField>,
+    size: PhysicalSize<u32>,
+) -> MenuLayout {
+    let width = size.width.max(1) as f32;
+    let height = size.height.max(1) as f32;
+    let mut overlay = UiOverlay::default();
+    let mut hits = Vec::new();
+
+    push_ui_rect(
+        &mut overlay,
+        ScreenRect::new(0.0, 0.0, width, height),
+        [0.025, 0.032, 0.036, 1.0],
+    );
+
+    match screen {
+        AppScreen::MainMenu => {
+            push_centered_text(
+                &mut overlay,
+                "ADVENTURE QUEST",
+                5.0,
+                width,
+                height * 0.16,
+                [1.0, 1.0, 1.0, 1.0],
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::Play,
+                ScreenRect::centered(width, height * 0.38, 320.0, 58.0),
+                "PLAY",
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::Settings,
+                ScreenRect::centered(width, height * 0.50, 320.0, 58.0),
+                "SETTINGS",
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::QuitGame,
+                ScreenRect::centered(width, height * 0.62, 320.0, 58.0),
+                "QUIT GAME",
+            );
+        }
+        AppScreen::WorldList => {
+            push_centered_text(
+                &mut overlay,
+                "SAVED WORLDS",
+                4.0,
+                width,
+                height * 0.14,
+                [1.0, 1.0, 1.0, 1.0],
+            );
+            push_centered_text(
+                &mut overlay,
+                "NO SAVED WORLDS YET",
+                2.0,
+                width,
+                height * 0.28,
+                [0.72, 0.78, 0.80, 1.0],
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::CreateWorld,
+                ScreenRect::centered(width, height * 0.42, 440.0, 58.0),
+                "CREATE NEW WORLD",
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::Back,
+                ScreenRect::centered(width, height * 0.54, 240.0, 52.0),
+                "BACK",
+            );
+        }
+        AppScreen::PauseMenu => {
+            push_centered_text(
+                &mut overlay,
+                "PAUSED",
+                5.0,
+                width,
+                height * 0.14,
+                [1.0, 1.0, 1.0, 1.0],
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::Resume,
+                ScreenRect::centered(width, height * 0.34, 360.0, 58.0),
+                "RESUME",
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::Settings,
+                ScreenRect::centered(width, height * 0.46, 360.0, 58.0),
+                "SETTINGS",
+            );
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::QuitToMenu,
+                ScreenRect::centered(width, height * 0.58, 360.0, 58.0),
+                "QUIT TO MENU",
+            );
+        }
+        AppScreen::Settings => {
+            push_centered_text(
+                &mut overlay,
+                "SETTINGS",
+                4.0,
+                width,
+                height * 0.12,
+                [1.0, 1.0, 1.0, 1.0],
+            );
+
+            let label_x = (width * 0.5 - 390.0).max(28.0);
+            let field_x = (width * 0.5 + 90.0).min(width - 300.0).max(label_x + 310.0);
+            let first_y = height * 0.30;
+            let second_y = height * 0.42;
+
+            push_text(
+                &mut overlay,
+                label_x,
+                first_y + 11.0,
+                2.4,
+                "MOUSE SENSITIVITY",
+                [0.86, 0.91, 0.93, 1.0],
+            );
+            push_textbox(
+                &mut overlay,
+                &mut hits,
+                MenuAction::MouseSensitivity,
+                ScreenRect::new(field_x, first_y, 260.0, 52.0),
+                &settings_inputs.mouse_sensitivity,
+                active_field == Some(SettingsField::MouseSensitivity),
+            );
+
+            push_text(
+                &mut overlay,
+                label_x,
+                second_y + 11.0,
+                2.4,
+                "RENDER CHUNK DISTANCE",
+                [0.86, 0.91, 0.93, 1.0],
+            );
+            push_textbox(
+                &mut overlay,
+                &mut hits,
+                MenuAction::ChunkViewDistance,
+                ScreenRect::new(field_x, second_y, 260.0, 52.0),
+                &settings_inputs.chunk_view_distance,
+                active_field == Some(SettingsField::ChunkViewDistance),
+            );
+
+            push_button(
+                &mut overlay,
+                &mut hits,
+                MenuAction::Back,
+                ScreenRect::centered(width, height * 0.62, 240.0, 52.0),
+                "BACK",
+            );
+        }
+        AppScreen::InGame => {}
+    }
+
+    MenuLayout { overlay, hits }
+}
+
+fn push_button(
+    overlay: &mut UiOverlay,
+    hits: &mut Vec<MenuHitRect>,
+    action: MenuAction,
+    rect: ScreenRect,
+    label: &str,
+) {
+    push_ui_rect(overlay, rect, [0.13, 0.17, 0.19, 1.0]);
+    push_ui_border(overlay, rect, 2.0, [0.42, 0.52, 0.56, 1.0]);
+    push_centered_text_in_rect(overlay, rect, label, 2.8, [1.0, 1.0, 1.0, 1.0]);
+    hits.push(MenuHitRect { action, rect });
+}
+
+fn push_textbox(
+    overlay: &mut UiOverlay,
+    hits: &mut Vec<MenuHitRect>,
+    action: MenuAction,
+    rect: ScreenRect,
+    value: &str,
+    active: bool,
+) {
+    push_ui_rect(
+        overlay,
+        rect,
+        if active {
+            [0.070, 0.105, 0.118, 1.0]
+        } else {
+            [0.035, 0.044, 0.050, 1.0]
+        },
+    );
+    push_ui_border(
+        overlay,
+        rect,
+        if active { 3.0 } else { 2.0 },
+        if active {
+            [0.98, 0.78, 0.30, 1.0]
+        } else {
+            [0.34, 0.42, 0.46, 1.0]
+        },
+    );
+    push_text(
+        overlay,
+        rect.x + 14.0,
+        rect.y + 13.0,
+        2.6,
+        value,
+        [1.0, 1.0, 1.0, 1.0],
+    );
+
+    if active {
+        let caret_x =
+            (rect.x + 14.0 + text_pixel_width(value, 2.6) + 5.0).min(rect.x + rect.width - 16.0);
+        push_ui_rect(
+            overlay,
+            ScreenRect::new(caret_x, rect.y + 10.0, 2.0, rect.height - 20.0),
+            [1.0, 0.92, 0.62, 1.0],
+        );
+    }
+
+    hits.push(MenuHitRect { action, rect });
+}
+
+fn push_ui_rect(overlay: &mut UiOverlay, rect: ScreenRect, color: [f32; 4]) {
+    overlay.items.push(UiOverlayItem::Rect(UiRect::new(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        color,
+    )));
+}
+
+fn push_ui_border(overlay: &mut UiOverlay, rect: ScreenRect, thickness: f32, color: [f32; 4]) {
+    push_ui_rect(
+        overlay,
+        ScreenRect::new(rect.x, rect.y, rect.width, thickness),
+        color,
+    );
+    push_ui_rect(
+        overlay,
+        ScreenRect::new(
+            rect.x,
+            rect.y + rect.height - thickness,
+            rect.width,
+            thickness,
+        ),
+        color,
+    );
+    push_ui_rect(
+        overlay,
+        ScreenRect::new(rect.x, rect.y, thickness, rect.height),
+        color,
+    );
+    push_ui_rect(
+        overlay,
+        ScreenRect::new(
+            rect.x + rect.width - thickness,
+            rect.y,
+            thickness,
+            rect.height,
+        ),
+        color,
+    );
+}
+
+fn push_centered_text(
+    overlay: &mut UiOverlay,
+    text: &str,
+    scale: f32,
+    width: f32,
+    y: f32,
+    color: [f32; 4],
+) {
+    let x = (width - text_pixel_width(text, scale)) * 0.5;
+    push_text(overlay, x.max(8.0), y, scale, text, color);
+}
+
+fn push_centered_text_in_rect(
+    overlay: &mut UiOverlay,
+    rect: ScreenRect,
+    text: &str,
+    scale: f32,
+    color: [f32; 4],
+) {
+    let text_width = text_pixel_width(text, scale);
+    let text_height = 7.0 * scale;
+    let x = rect.x + (rect.width - text_width) * 0.5;
+    let y = rect.y + (rect.height - text_height) * 0.5;
+
+    push_text(overlay, x, y, scale, text, color);
+}
+
+fn push_text(overlay: &mut UiOverlay, x: f32, y: f32, scale: f32, text: &str, color: [f32; 4]) {
+    overlay
+        .items
+        .push(UiOverlayItem::Text(UiText::new(x, y, scale, color, text)));
+}
+
+fn text_pixel_width(text: &str, scale: f32) -> f32 {
+    text.chars()
+        .map(|character| if character == ' ' { 4.0 } else { 6.0 })
+        .sum::<f32>()
+        * scale
+}
+
+fn is_settings_character_allowed(field: SettingsField, character: char) -> bool {
+    match field {
+        SettingsField::MouseSensitivity => character.is_ascii_digit() || character == '.',
+        SettingsField::ChunkViewDistance => character.is_ascii_digit(),
+    }
+}
+
+fn settings_input_limit(field: SettingsField) -> usize {
+    match field {
+        SettingsField::MouseSensitivity => 8,
+        SettingsField::ChunkViewDistance => 2,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum BlockAction {
@@ -706,6 +1560,126 @@ impl DirtyMeshQueue {
     }
 }
 
+struct ChunkJobQueue {
+    sender: Sender<ChunkJob>,
+    receiver: Receiver<ChunkJobResult>,
+    pending_generation: HashSet<ChunkCoord>,
+    pending_meshes: HashSet<ChunkCoord>,
+}
+
+impl ChunkJobQueue {
+    fn enqueue_generation(&mut self, seed: u64, coord: ChunkCoord) -> bool {
+        if !self.pending_generation.insert(coord) {
+            return false;
+        }
+
+        if self.sender.send(ChunkJob::Generate { seed, coord }).is_ok() {
+            true
+        } else {
+            self.pending_generation.remove(&coord);
+            false
+        }
+    }
+
+    fn enqueue_mesh(&mut self, input: ChunkMeshInput) -> bool {
+        let coord = input.coord;
+
+        if !self.pending_meshes.insert(coord) {
+            return false;
+        }
+
+        if self.sender.send(ChunkJob::Mesh(input)).is_ok() {
+            true
+        } else {
+            self.pending_meshes.remove(&coord);
+            false
+        }
+    }
+
+    fn is_generation_pending(&self, coord: ChunkCoord) -> bool {
+        self.pending_generation.contains(&coord)
+    }
+
+    fn is_mesh_pending(&self, coord: ChunkCoord) -> bool {
+        self.pending_meshes.contains(&coord)
+    }
+
+    fn drain_results(&mut self) -> Vec<ChunkJobResult> {
+        let mut results = Vec::new();
+
+        while let Ok(result) = self.receiver.try_recv() {
+            match &result {
+                ChunkJobResult::Generated { coord, .. } => {
+                    self.pending_generation.remove(coord);
+                }
+                ChunkJobResult::Meshed { coord, .. } => {
+                    self.pending_meshes.remove(coord);
+                }
+            }
+
+            results.push(result);
+        }
+
+        results
+    }
+}
+
+impl Default for ChunkJobQueue {
+    fn default() -> Self {
+        let (job_sender, job_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+
+        thread::Builder::new()
+            .name("aq-chunk-worker".to_string())
+            .spawn(move || run_chunk_worker(job_receiver, result_sender))
+            .expect("chunk worker thread should start");
+
+        Self {
+            sender: job_sender,
+            receiver: result_receiver,
+            pending_generation: HashSet::new(),
+            pending_meshes: HashSet::new(),
+        }
+    }
+}
+
+enum ChunkJob {
+    Generate { seed: u64, coord: ChunkCoord },
+    Mesh(ChunkMeshInput),
+}
+
+enum ChunkJobResult {
+    Generated {
+        coord: ChunkCoord,
+        chunk: Chunk,
+    },
+    Meshed {
+        coord: ChunkCoord,
+        revision: u32,
+        mesh: MeshData,
+    },
+}
+
+fn run_chunk_worker(receiver: Receiver<ChunkJob>, sender: Sender<ChunkJobResult>) {
+    while let Ok(job) = receiver.recv() {
+        let result = match job {
+            ChunkJob::Generate { seed, coord } => ChunkJobResult::Generated {
+                coord,
+                chunk: VoxelWorld::generate_chunk(seed, coord),
+            },
+            ChunkJob::Mesh(input) => ChunkJobResult::Meshed {
+                coord: input.coord,
+                revision: input.revision,
+                mesh: mesh_chunk_input(&input),
+            },
+        };
+
+        if sender.send(result).is_err() {
+            break;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ChunkStreamingState {
     settings: WorldStreamingSettings,
@@ -714,6 +1688,26 @@ struct ChunkStreamingState {
 }
 
 impl ChunkStreamingState {
+    fn new(settings: WorldStreamingSettings) -> Self {
+        Self {
+            settings,
+            center_chunk: None,
+            pending_loads: VecDeque::new(),
+        }
+    }
+
+    fn set_settings(&mut self, settings: WorldStreamingSettings) {
+        if self.settings == settings {
+            return;
+        }
+
+        self.settings = settings;
+
+        if let Some(center) = self.center_chunk {
+            self.pending_loads = streaming_chunk_coords(center, self.settings);
+        }
+    }
+
     fn update_center(&mut self, center: ChunkCoord) -> bool {
         if self.center_chunk == Some(center) {
             return false;
@@ -838,7 +1832,7 @@ impl WindowChunkMesh {
 
 fn build_window_world() -> WindowWorldState {
     let mut world = VoxelWorld::new(12345);
-    let player_block = BlockPos::new(0, 40, 0);
+    let player_block = camera_block_position(VoxelCamera::looking_at_chunk_origin().position);
 
     world.load_chunks_around_block(player_block, WorldStreamingSettings::prototype());
 
@@ -893,19 +1887,24 @@ fn dirty_window_chunk_coords(world: &VoxelWorld) -> Vec<ChunkCoord> {
     coords
 }
 
-fn upload_window_chunk_mesh(
+fn apply_mesh_job_result(
     world: &mut VoxelWorld,
     renderer: &mut ClearRenderer,
+    dirty_mesh_queue: &mut DirtyMeshQueue,
     coord: ChunkCoord,
+    revision: u32,
+    mesh: MeshData,
 ) {
-    let Some(mesh) = mesh_chunk(world, coord) else {
+    let Some(current_revision) = world.get_chunk(coord).map(|chunk| chunk.revision) else {
         renderer.remove_chunk_mesh(coord);
         return;
     };
-    let revision = world
-        .get_chunk(coord)
-        .map(|chunk| chunk.revision)
-        .unwrap_or_default();
+
+    if current_revision != revision {
+        dirty_mesh_queue.enqueue(coord);
+        return;
+    }
+
     let visible_mask = mesh.subchunk_visible_mask;
 
     if let Some(chunk) = world.get_chunk_mut(coord) {
@@ -1117,6 +2116,63 @@ mod tests {
     }
 
     #[test]
+    fn main_menu_layout_has_quit_game_action() {
+        let layout = build_menu_layout(
+            AppScreen::MainMenu,
+            &SettingsInputs::from_settings(GameSettings::default()),
+            None,
+            PhysicalSize::new(1280, 720),
+        );
+
+        assert!(layout
+            .hits
+            .iter()
+            .any(|hit| hit.action == MenuAction::QuitGame));
+    }
+
+    #[test]
+    fn pause_menu_layout_has_resume_settings_and_quit_to_menu() {
+        let layout = build_menu_layout(
+            AppScreen::PauseMenu,
+            &SettingsInputs::from_settings(GameSettings::default()),
+            None,
+            PhysicalSize::new(1280, 720),
+        );
+
+        assert!(layout
+            .hits
+            .iter()
+            .any(|hit| hit.action == MenuAction::Resume));
+        assert!(layout
+            .hits
+            .iter()
+            .any(|hit| hit.action == MenuAction::Settings));
+        assert!(layout
+            .hits
+            .iter()
+            .any(|hit| hit.action == MenuAction::QuitToMenu));
+    }
+
+    #[test]
+    fn active_settings_textbox_adds_visual_highlight_geometry() {
+        let settings_inputs = SettingsInputs::from_settings(GameSettings::default());
+        let inactive = build_menu_layout(
+            AppScreen::Settings,
+            &settings_inputs,
+            None,
+            PhysicalSize::new(1280, 720),
+        );
+        let active = build_menu_layout(
+            AppScreen::Settings,
+            &settings_inputs,
+            Some(SettingsField::MouseSensitivity),
+            PhysicalSize::new(1280, 720),
+        );
+
+        assert!(active.overlay.items.len() > inactive.overlay.items.len());
+    }
+
+    #[test]
     fn camera_block_position_floors_negative_coordinates() {
         assert_eq!(
             camera_block_position([-0.1, 42.9, -32.0]),
@@ -1209,5 +2265,69 @@ mod tests {
         assert!((player.center[1] - 1.901).abs() < 0.0001);
         assert_eq!(player.velocity[1], 0.0);
         assert!(player.on_ground);
+    }
+
+    #[test]
+    fn chunk_worker_generates_chunks_off_thread() {
+        let (job_sender, job_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || run_chunk_worker(job_receiver, result_sender));
+        let coord = ChunkCoord::new(2, 0, -1);
+
+        job_sender
+            .send(ChunkJob::Generate { seed: 99, coord })
+            .unwrap();
+
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        match result {
+            ChunkJobResult::Generated {
+                coord: result_coord,
+                chunk,
+            } => {
+                assert_eq!(result_coord, coord);
+                assert_eq!(chunk.coord, coord);
+            }
+            ChunkJobResult::Meshed { .. } => panic!("expected generated chunk"),
+        }
+
+        drop(job_sender);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn chunk_worker_meshes_snapshots_off_thread() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_empty_chunks([coord]);
+        world.set_block(BlockPos::new(0, 0, 0), STONE_BLOCK);
+        let input = ChunkMeshInput::from_world(&world, coord).expect("mesh input exists");
+        let revision = input.revision;
+        let (job_sender, job_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || run_chunk_worker(job_receiver, result_sender));
+
+        job_sender.send(ChunkJob::Mesh(input)).unwrap();
+
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        match result {
+            ChunkJobResult::Meshed {
+                coord: result_coord,
+                revision: result_revision,
+                mesh,
+            } => {
+                assert_eq!(result_coord, coord);
+                assert_eq!(result_revision, revision);
+                assert_eq!(mesh.visible_face_count, 6);
+            }
+            ChunkJobResult::Generated { .. } => panic!("expected mesh result"),
+        }
+
+        drop(job_sender);
+        handle.join().unwrap();
     }
 }

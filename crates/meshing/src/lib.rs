@@ -42,6 +42,29 @@ impl MeshData {
     }
 }
 
+pub struct ChunkMeshInput {
+    pub coord: ChunkCoord,
+    pub revision: u32,
+    pub center: Chunk,
+    pub neighbors: [Option<Chunk>; 6],
+}
+
+impl ChunkMeshInput {
+    pub fn from_world(world: &VoxelWorld, coord: ChunkCoord) -> Option<Self> {
+        let center = world.get_chunk(coord)?.clone();
+        let revision = center.revision;
+        let neighbors = neighbor_chunk_coords(coord)
+            .map(|neighbor_coord| world.get_chunk(neighbor_coord).cloned());
+
+        Some(Self {
+            coord,
+            revision,
+            center,
+            neighbors,
+        })
+    }
+}
+
 pub fn mesh_chunk(world: &VoxelWorld, coord: ChunkCoord) -> Option<MeshData> {
     let chunk = world.get_chunk(coord)?;
 
@@ -51,16 +74,35 @@ pub fn mesh_chunk(world: &VoxelWorld, coord: ChunkCoord) -> Option<MeshData> {
 
     let mut mesh = MeshData::default();
     mesh_block_range(
-        world,
         chunk,
         coord,
         0..CHUNK_SIZE,
         0..CHUNK_SIZE,
         0..CHUNK_SIZE,
         &mut mesh,
+        |chunk, coord, x, y, z, dir| neighbor_block(world, chunk, coord, x, y, z, dir),
     );
 
     Some(mesh)
+}
+
+pub fn mesh_chunk_input(input: &ChunkMeshInput) -> MeshData {
+    if input.center.is_empty() {
+        return MeshData::default();
+    }
+
+    let mut mesh = MeshData::default();
+    mesh_block_range(
+        &input.center,
+        input.coord,
+        0..CHUNK_SIZE,
+        0..CHUNK_SIZE,
+        0..CHUNK_SIZE,
+        &mut mesh,
+        |chunk, coord, x, y, z, dir| snapshot_neighbor_block(input, chunk, coord, x, y, z, dir),
+    );
+
+    mesh
 }
 
 pub fn mesh_subchunk(world: &VoxelWorld, coord: ChunkCoord, subchunk: usize) -> Option<MeshData> {
@@ -77,7 +119,15 @@ pub fn mesh_subchunk(world: &VoxelWorld, coord: ChunkCoord, subchunk: usize) -> 
     let (x_range, y_range, z_range) = subchunk_ranges(subchunk);
     let mut mesh = MeshData::default();
 
-    mesh_block_range(world, chunk, coord, x_range, y_range, z_range, &mut mesh);
+    mesh_block_range(
+        chunk,
+        coord,
+        x_range,
+        y_range,
+        z_range,
+        &mut mesh,
+        |chunk, coord, x, y, z, dir| neighbor_block(world, chunk, coord, x, y, z, dir),
+    );
 
     Some(mesh)
 }
@@ -111,13 +161,13 @@ const ALL_DIRECTIONS: [Direction; 6] = [
 ];
 
 fn mesh_block_range(
-    world: &VoxelWorld,
     chunk: &Chunk,
     coord: ChunkCoord,
     x_range: Range<usize>,
     y_range: Range<usize>,
     z_range: Range<usize>,
     mesh: &mut MeshData,
+    neighbor_block: impl Fn(&Chunk, ChunkCoord, usize, usize, usize, Direction) -> BlockId,
 ) {
     for y in y_range {
         for z in z_range.clone() {
@@ -134,7 +184,7 @@ fn mesh_block_range(
                 let world_pos = BlockPos::new(world_x, world_y, world_z);
 
                 for dir in ALL_DIRECTIONS {
-                    let neighbor = neighbor_block(world, chunk, coord, x, y, z, dir);
+                    let neighbor = neighbor_block(chunk, coord, x, y, z, dir);
 
                     if neighbor == AIR_BLOCK {
                         let subchunk = subchunk_index(x, y, z);
@@ -145,6 +195,17 @@ fn mesh_block_range(
             }
         }
     }
+}
+
+fn neighbor_chunk_coords(coord: ChunkCoord) -> [ChunkCoord; 6] {
+    [
+        coord.offset(1, 0, 0),
+        coord.offset(-1, 0, 0),
+        coord.offset(0, 1, 0),
+        coord.offset(0, -1, 0),
+        coord.offset(0, 0, 1),
+        coord.offset(0, 0, -1),
+    ]
 }
 
 fn subchunk_ranges(subchunk: usize) -> (Range<usize>, Range<usize>, Range<usize>) {
@@ -192,6 +253,44 @@ fn neighbor_block(
             neighbor_chunk_block(world, coord.offset(0, 0, -1), x, y, CHUNK_SIZE - 1)
         }
     }
+}
+
+fn snapshot_neighbor_block(
+    input: &ChunkMeshInput,
+    chunk: &Chunk,
+    _coord: ChunkCoord,
+    x: usize,
+    y: usize,
+    z: usize,
+    dir: Direction,
+) -> BlockId {
+    match dir {
+        Direction::PosX if x + 1 < CHUNK_SIZE => chunk.get_block(x + 1, y, z),
+        Direction::NegX if x > 0 => chunk.get_block(x - 1, y, z),
+        Direction::PosY if y + 1 < CHUNK_SIZE => chunk.get_block(x, y + 1, z),
+        Direction::NegY if y > 0 => chunk.get_block(x, y - 1, z),
+        Direction::PosZ if z + 1 < CHUNK_SIZE => chunk.get_block(x, y, z + 1),
+        Direction::NegZ if z > 0 => chunk.get_block(x, y, z - 1),
+        Direction::PosX => snapshot_neighbor_chunk_block(input, 0, 0, y, z),
+        Direction::NegX => snapshot_neighbor_chunk_block(input, 1, CHUNK_SIZE - 1, y, z),
+        Direction::PosY => snapshot_neighbor_chunk_block(input, 2, x, 0, z),
+        Direction::NegY => snapshot_neighbor_chunk_block(input, 3, x, CHUNK_SIZE - 1, z),
+        Direction::PosZ => snapshot_neighbor_chunk_block(input, 4, x, y, 0),
+        Direction::NegZ => snapshot_neighbor_chunk_block(input, 5, x, y, CHUNK_SIZE - 1),
+    }
+}
+
+fn snapshot_neighbor_chunk_block(
+    input: &ChunkMeshInput,
+    neighbor_index: usize,
+    x: usize,
+    y: usize,
+    z: usize,
+) -> BlockId {
+    input.neighbors[neighbor_index]
+        .as_ref()
+        .map(|chunk| chunk.get_block(x, y, z))
+        .unwrap_or(AIR_BLOCK)
 }
 
 fn neighbor_chunk_block(
@@ -376,6 +475,34 @@ mod tests {
         assert_eq!(neighbor_mesh.visible_face_count, 5);
         assert_eq!(origin_mesh.subchunk_visible_mask, subchunk_bit(1));
         assert_eq!(neighbor_mesh.subchunk_visible_mask, subchunk_bit(0));
+    }
+
+    #[test]
+    fn snapshot_mesh_matches_live_world_mesh() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let neighbor_coord = ChunkCoord::new(1, 0, 0);
+        let mut world = world_with_empty_chunk(coord);
+        world
+            .chunks
+            .insert(neighbor_coord, Chunk::new_empty(neighbor_coord));
+
+        world.set_block(BlockPos::new(31, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(32, 0, 0), STONE_BLOCK);
+
+        let input = ChunkMeshInput::from_world(&world, coord).expect("snapshot exists");
+        let live_mesh = mesh_chunk(&world, coord).expect("live mesh exists");
+        let snapshot_mesh = mesh_chunk_input(&input);
+
+        assert_eq!(input.revision, world.get_chunk(coord).unwrap().revision);
+        assert_eq!(
+            snapshot_mesh.visible_face_count,
+            live_mesh.visible_face_count
+        );
+        assert_eq!(snapshot_mesh.indices.len(), live_mesh.indices.len());
+        assert_eq!(
+            snapshot_mesh.subchunk_visible_mask,
+            live_mesh.subchunk_visible_mask
+        );
     }
 
     #[test]

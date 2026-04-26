@@ -54,6 +54,7 @@ pub fn world_to_local_block(x: i32, y: i32, z: i32) -> (usize, usize, usize) {
     )
 }
 
+#[derive(Clone)]
 pub struct Chunk {
     pub coord: ChunkCoord,
 
