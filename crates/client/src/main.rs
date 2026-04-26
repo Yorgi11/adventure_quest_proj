@@ -1,11 +1,16 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    cmp::Reverse,
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
+    path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
+
+mod config;
+mod persistence;
 
 use foundation::{BlockPos, ChunkCoord};
 use gameplay::{
@@ -27,6 +32,8 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 use world::{VoxelWorld, WorldStreamingSettings};
+
+use persistence::SavedSettings;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let options = ClientOptions::from_args(std::env::args().skip(1));
@@ -123,19 +130,40 @@ struct GameSettings {
 
 impl GameSettings {
     fn streaming_settings(self) -> WorldStreamingSettings {
-        let radius = self
-            .chunk_view_distance
-            .clamp(MIN_CHUNK_VIEW_DISTANCE, MAX_CHUNK_VIEW_DISTANCE);
+        let radius = self.chunk_view_distance.clamp(
+            config::MIN_RENDER_CHUNK_DISTANCE,
+            config::MAX_RENDER_CHUNK_DISTANCE,
+        );
+        let vertical_radius = radius.min(config::MAX_VERTICAL_RENDER_CHUNK_DISTANCE);
 
-        WorldStreamingSettings::new(radius, radius, radius, radius, radius, radius + 1)
+        WorldStreamingSettings::new(radius, vertical_radius, radius, radius, radius, radius + 1)
+    }
+
+    fn from_saved(settings: SavedSettings) -> Self {
+        Self {
+            mouse_sensitivity: settings
+                .mouse_sensitivity
+                .clamp(config::MIN_MOUSE_SENSITIVITY, config::MAX_MOUSE_SENSITIVITY),
+            chunk_view_distance: settings.render_chunk_distance.clamp(
+                config::MIN_RENDER_CHUNK_DISTANCE,
+                config::MAX_RENDER_CHUNK_DISTANCE,
+            ),
+        }
+    }
+
+    fn saved(self) -> SavedSettings {
+        SavedSettings {
+            mouse_sensitivity: self.mouse_sensitivity,
+            render_chunk_distance: self.chunk_view_distance,
+        }
     }
 }
 
 impl Default for GameSettings {
     fn default() -> Self {
         Self {
-            mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
-            chunk_view_distance: DEFAULT_CHUNK_VIEW_DISTANCE,
+            mouse_sensitivity: config::DEFAULT_MOUSE_SENSITIVITY,
+            chunk_view_distance: config::DEFAULT_RENDER_CHUNK_DISTANCE,
         }
     }
 }
@@ -175,6 +203,10 @@ struct AdventureQuestApp {
     settings_inputs: SettingsInputs,
     active_settings_field: Option<SettingsField>,
     settings_back_screen: AppScreen,
+    save_dir: PathBuf,
+    saved_chunks: HashMap<ChunkCoord, Chunk>,
+    modified_chunk_coords: HashSet<ChunkCoord>,
+    world_save_dirty: bool,
     dirty_mesh_queue: DirtyMeshQueue,
     streaming: ChunkStreamingState,
     chunk_jobs: ChunkJobQueue,
@@ -182,6 +214,10 @@ struct AdventureQuestApp {
 
 impl AdventureQuestApp {
     fn new(options: ClientOptions) -> Self {
+        let save_dir = persistence::default_save_dir();
+        let settings = load_saved_game_settings(&save_dir);
+        let saved_chunks = load_saved_world_chunks(&save_dir);
+
         Self {
             window: None,
             renderer: None,
@@ -198,10 +234,14 @@ impl AdventureQuestApp {
             noclip_enabled: false,
             mouse_look_active: false,
             mouse_position: PhysicalPosition::new(0.0, 0.0),
-            settings: GameSettings::default(),
-            settings_inputs: SettingsInputs::from_settings(GameSettings::default()),
+            settings,
+            settings_inputs: SettingsInputs::from_settings(settings),
             active_settings_field: None,
             settings_back_screen: AppScreen::MainMenu,
+            save_dir,
+            saved_chunks,
+            modified_chunk_coords: HashSet::new(),
+            world_save_dirty: false,
             dirty_mesh_queue: DirtyMeshQueue::default(),
             streaming: ChunkStreamingState::default(),
             chunk_jobs: ChunkJobQueue::default(),
@@ -288,7 +328,15 @@ impl ApplicationHandler for AdventureQuestApp {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.screen == AppScreen::Settings {
+                    self.apply_settings_from_inputs();
+                } else {
+                    self.save_settings();
+                }
+                self.save_current_world_if_dirty();
+                event_loop.exit();
+            }
             WindowEvent::Focused(focused) => {
                 if focused {
                     if self.screen == AppScreen::InGame {
@@ -520,6 +568,8 @@ impl AdventureQuestApp {
                 self.quit_to_main_menu(window);
             }
             MenuAction::QuitGame => {
+                self.save_settings();
+                self.save_current_world_if_dirty();
                 event_loop.exit();
             }
             MenuAction::MouseSensitivity => {
@@ -663,13 +713,16 @@ impl AdventureQuestApp {
             .ok()
             .filter(|value| value.is_finite() && *value > 0.0)
             .unwrap_or(self.settings.mouse_sensitivity)
-            .clamp(MIN_MOUSE_SENSITIVITY, MAX_MOUSE_SENSITIVITY);
+            .clamp(config::MIN_MOUSE_SENSITIVITY, config::MAX_MOUSE_SENSITIVITY);
         let chunk_view_distance = self
             .settings_inputs
             .chunk_view_distance
             .parse::<i32>()
             .unwrap_or(self.settings.chunk_view_distance)
-            .clamp(MIN_CHUNK_VIEW_DISTANCE, MAX_CHUNK_VIEW_DISTANCE);
+            .clamp(
+                config::MIN_RENDER_CHUNK_DISTANCE,
+                config::MAX_RENDER_CHUNK_DISTANCE,
+            );
 
         self.settings = GameSettings {
             mouse_sensitivity,
@@ -678,20 +731,67 @@ impl AdventureQuestApp {
         self.settings_inputs = SettingsInputs::from_settings(self.settings);
         self.streaming
             .set_settings(self.settings.streaming_settings());
+        self.save_settings();
+    }
+
+    fn save_settings(&self) {
+        if let Err(error) = persistence::save_settings(&self.save_dir, self.settings.saved()) {
+            eprintln!("Failed to save settings: {error}");
+        }
+    }
+
+    fn save_current_world_if_dirty(&mut self) {
+        if !self.world_save_dirty {
+            return;
+        }
+
+        let Some(world) = self.world.as_ref() else {
+            self.world_save_dirty = false;
+            self.modified_chunk_coords.clear();
+            return;
+        };
+
+        for coord in self.modified_chunk_coords.iter().copied() {
+            let Some(chunk) = world.get_chunk(coord) else {
+                self.saved_chunks.remove(&coord);
+                continue;
+            };
+
+            let generated = VoxelWorld::generate_chunk(world.seed(), coord);
+
+            if chunk.blocks() == generated.blocks() {
+                self.saved_chunks.remove(&coord);
+            } else {
+                self.saved_chunks.insert(coord, chunk.clone());
+            }
+        }
+
+        match persistence::save_chunks(&self.save_dir, world.seed(), &self.saved_chunks) {
+            Ok(saved_chunks) => {
+                println!("Saved {saved_chunks} modified chunks");
+                self.world_save_dirty = false;
+                self.modified_chunk_coords.clear();
+            }
+            Err(error) => eprintln!("Failed to save world chunks: {error}"),
+        }
     }
 
     fn start_existing_world(&mut self, window: &Window) {
         self.release_mouse(window);
+        self.saved_chunks = load_saved_world_chunks(&self.save_dir);
         self.camera = VoxelCamera::looking_at_chunk_origin();
         self.player = PlayerController::from_camera(self.camera);
         self.input = InputState::default();
         self.last_frame = None;
         self.noclip_enabled = false;
+        self.world_save_dirty = false;
+        self.modified_chunk_coords.clear();
         self.dirty_mesh_queue = DirtyMeshQueue::default();
         self.streaming = ChunkStreamingState::new(self.settings.streaming_settings());
         self.chunk_jobs = ChunkJobQueue::default();
 
-        let window_world = build_window_world();
+        let window_world =
+            build_window_world(self.settings.streaming_settings(), &self.saved_chunks);
 
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_camera(self.camera);
@@ -744,6 +844,7 @@ impl AdventureQuestApp {
     }
 
     fn quit_to_main_menu(&mut self, window: &Window) {
+        self.save_current_world_if_dirty();
         self.release_mouse(window);
         self.world = None;
         self.input = InputState::default();
@@ -754,6 +855,8 @@ impl AdventureQuestApp {
         self.dirty_mesh_queue = DirtyMeshQueue::default();
         self.streaming = ChunkStreamingState::new(self.settings.streaming_settings());
         self.chunk_jobs = ChunkJobQueue::default();
+        self.world_save_dirty = false;
+        self.modified_chunk_coords.clear();
         self.screen = AppScreen::MainMenu;
 
         if let Some(renderer) = self.renderer.as_mut() {
@@ -827,6 +930,8 @@ impl AdventureQuestApp {
             }
         };
         let changed_blocks = changed_block_count(result);
+        let priority_chunks = interaction_priority_chunks(result);
+        let modified_chunks = interaction_modified_chunks(result);
 
         print_window_interaction(result);
 
@@ -834,7 +939,18 @@ impl AdventureQuestApp {
             return;
         }
 
-        self.dirty_mesh_queue.enqueue_dirty(world);
+        self.world_save_dirty = true;
+        self.modified_chunk_coords.extend(modified_chunks);
+        self.dirty_mesh_queue
+            .enqueue_priority(priority_chunks.iter().copied());
+
+        for coord in priority_chunks {
+            let Some(input) = ChunkMeshInput::from_world(world, coord) else {
+                continue;
+            };
+
+            self.chunk_jobs.enqueue_mesh_priority(input);
+        }
     }
 
     fn process_completed_chunk_jobs(&mut self) {
@@ -848,6 +964,8 @@ impl AdventureQuestApp {
         for result in self.chunk_jobs.drain_results() {
             match result {
                 ChunkJobResult::Generated { coord, chunk } => {
+                    let chunk = self.saved_chunks.get(&coord).cloned().unwrap_or(chunk);
+
                     if world.insert_chunk(chunk) {
                         for dirty_coord in mark_streamed_chunk_dirty(world, coord) {
                             self.dirty_mesh_queue.enqueue(dirty_coord);
@@ -858,7 +976,16 @@ impl AdventureQuestApp {
                     coord,
                     revision,
                     mesh,
+                    ..
                 } => {
+                    if !chunk_within_render_distance(
+                        camera_chunk_coord(self.camera),
+                        coord,
+                        self.settings.streaming_settings(),
+                    ) {
+                        continue;
+                    }
+
                     apply_mesh_job_result(
                         world,
                         renderer,
@@ -876,13 +1003,24 @@ impl AdventureQuestApp {
         let Some(world) = self.world.as_mut() else {
             return;
         };
+        let center = camera_chunk_coord(self.camera);
+        let settings = self.settings.streaming_settings();
 
-        self.dirty_mesh_queue.enqueue_dirty(world);
+        self.dirty_mesh_queue
+            .enqueue_dirty_within(world, center, settings);
 
-        for _ in 0..DIRTY_MESH_JOBS_PER_FRAME {
+        for _ in 0..config::DIRTY_MESH_JOBS_PER_FRAME {
+            if self.chunk_jobs.normal_mesh_pending_count() >= config::MAX_PENDING_NORMAL_MESH_JOBS {
+                break;
+            }
+
             let Some(coord) = self.dirty_mesh_queue.pop_dirty(world) else {
                 break;
             };
+
+            if !chunk_within_render_distance(center, coord, settings) {
+                continue;
+            }
 
             if self.chunk_jobs.is_mesh_pending(coord) {
                 continue;
@@ -897,7 +1035,7 @@ impl AdventureQuestApp {
     }
 
     fn process_chunk_streaming(&mut self) {
-        let Some(world) = self.world.as_mut() else {
+        let Some(seed) = self.world.as_ref().map(VoxelWorld::seed) else {
             return;
         };
 
@@ -906,9 +1044,17 @@ impl AdventureQuestApp {
             println!("Streaming around chunk {:?}", center);
         }
 
-        let seed = world.seed();
+        self.prune_loaded_chunks();
+        self.sync_render_radius();
 
-        for _ in 0..CHUNK_GENERATION_JOBS_PER_FRAME {
+        for _ in 0..config::CHUNK_GENERATION_JOBS_PER_FRAME {
+            if self.chunk_jobs.generation_pending_count() >= config::MAX_PENDING_GENERATION_JOBS {
+                break;
+            }
+
+            let Some(world) = self.world.as_ref() else {
+                break;
+            };
             let Some(coord) = self.streaming.pop_missing(world) else {
                 break;
             };
@@ -920,10 +1066,144 @@ impl AdventureQuestApp {
             self.chunk_jobs.enqueue_generation(seed, coord);
         }
     }
+
+    fn prune_loaded_chunks(&mut self) {
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+
+        if world.chunks.len() <= config::MAX_ACTIVE_WORLD_CHUNKS {
+            return;
+        }
+
+        let center = camera_chunk_coord(self.camera);
+        let overflow = world.chunks.len() - config::MAX_ACTIVE_WORLD_CHUNKS;
+        let mut removable_coords: Vec<ChunkCoord> = world
+            .chunks
+            .keys()
+            .copied()
+            .filter(|coord| !self.modified_chunk_coords.contains(coord))
+            .collect();
+
+        removable_coords.sort_by_key(|coord| Reverse(chunk_distance_key(center, *coord)));
+
+        let mut removed = 0;
+
+        for coord in removable_coords.into_iter().take(overflow) {
+            if world.chunks.remove(&coord).is_some() {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.remove_chunk_mesh(coord);
+                }
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            println!("Pruned {removed} far loaded chunks");
+        }
+    }
+
+    fn sync_render_radius(&mut self) {
+        let center = camera_chunk_coord(self.camera);
+        let settings = self.settings.streaming_settings();
+        let rendered_coords: Vec<ChunkCoord> = self
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.chunk_mesh_info().map(|info| info.coord).collect())
+            .unwrap_or_default();
+
+        let mut retained_rendered_coords = Vec::new();
+        let mut meshes_to_remove = Vec::new();
+
+        for coord in rendered_coords {
+            if chunk_within_render_distance(center, coord, settings) {
+                retained_rendered_coords.push(coord);
+            } else {
+                meshes_to_remove.push(coord);
+            }
+        }
+
+        retained_rendered_coords.sort_by_key(|coord| chunk_distance_key(center, *coord));
+
+        if retained_rendered_coords.len() > config::MAX_RENDERED_CHUNK_MESHES {
+            meshes_to_remove
+                .extend(retained_rendered_coords.drain(config::MAX_RENDERED_CHUNK_MESHES..));
+        }
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            for coord in &meshes_to_remove {
+                renderer.remove_chunk_mesh(*coord);
+            }
+        }
+
+        let rendered_lookup: HashSet<ChunkCoord> =
+            retained_rendered_coords.iter().copied().collect();
+        let available_render_slots =
+            config::MAX_RENDERED_CHUNK_MESHES.saturating_sub(rendered_lookup.len());
+
+        if available_render_slots == 0 {
+            return;
+        }
+
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
+
+        let available_queue_slots = config::MAX_DIRTY_MESH_QUEUE_BACKLOG
+            .saturating_sub(self.dirty_mesh_queue.pending_count());
+        if available_queue_slots == 0 {
+            return;
+        }
+
+        let mut chunks_to_mesh: Vec<ChunkCoord> = world
+            .chunks
+            .keys()
+            .copied()
+            .filter(|coord| chunk_within_render_distance(center, *coord, settings))
+            .filter(|coord| !rendered_lookup.contains(coord))
+            .collect();
+        chunks_to_mesh.sort_by_key(|coord| chunk_distance_key(center, *coord));
+        chunks_to_mesh.truncate(
+            config::MAX_NEW_RENDER_MESHES_QUEUED_PER_FRAME
+                .min(available_queue_slots)
+                .min(available_render_slots),
+        );
+
+        let mut queued_coords = Vec::new();
+
+        for coord in chunks_to_mesh {
+            if mark_all_subchunks_dirty(world, coord) {
+                queued_coords.push(coord);
+            }
+        }
+
+        self.dirty_mesh_queue.enqueue_priority(queued_coords);
+    }
 }
 
 fn window_center_position(size: PhysicalSize<u32>) -> PhysicalPosition<f64> {
     PhysicalPosition::new(size.width as f64 * 0.5, size.height as f64 * 0.5)
+}
+
+fn load_saved_game_settings(save_dir: &std::path::Path) -> GameSettings {
+    match persistence::load_settings(save_dir) {
+        Ok(Some(settings)) => GameSettings::from_saved(settings),
+        Ok(None) => GameSettings::default(),
+        Err(error) => {
+            eprintln!("Failed to load saved settings: {error}");
+            GameSettings::default()
+        }
+    }
+}
+
+fn load_saved_world_chunks(save_dir: &std::path::Path) -> HashMap<ChunkCoord, Chunk> {
+    match persistence::load_saved_chunks(save_dir) {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            eprintln!("Failed to load saved world chunks: {error}");
+            HashMap::new()
+        }
+    }
 }
 
 fn camera_chunk_coord(camera: VoxelCamera) -> ChunkCoord {
@@ -950,12 +1230,17 @@ fn streaming_chunk_coords(
     for dy in -vertical_radius..=vertical_radius {
         for dz in -horizontal_radius..=horizontal_radius {
             for dx in -horizontal_radius..=horizontal_radius {
+                if dx * dx + dz * dz > horizontal_radius * horizontal_radius {
+                    continue;
+                }
+
                 coords.push(center.offset(dx, dy, dz));
             }
         }
     }
 
     coords.sort_by_key(|coord| chunk_distance_key(center, *coord));
+    coords.truncate(config::MAX_STREAMING_COORDS_PER_CENTER);
     coords.into()
 }
 
@@ -965,6 +1250,75 @@ fn chunk_distance_key(center: ChunkCoord, coord: ChunkCoord) -> i32 {
     let dz = coord.z - center.z;
 
     dx * dx + dy * dy + dz * dz
+}
+
+fn chunk_within_render_distance(
+    center: ChunkCoord,
+    coord: ChunkCoord,
+    settings: WorldStreamingSettings,
+) -> bool {
+    let horizontal_radius = settings.render_radius.max(0);
+    let vertical_radius = settings.vertical_load_radius.max(0);
+    let dx = (coord.x - center.x).abs();
+    let dy = (coord.y - center.y).abs();
+    let dz = (coord.z - center.z).abs();
+
+    dy <= vertical_radius && dx * dx + dz * dz <= horizontal_radius * horizontal_radius
+}
+
+fn interaction_priority_chunks(interaction: BlockInteraction) -> Vec<ChunkCoord> {
+    let mut coords = Vec::new();
+
+    match interaction {
+        BlockInteraction::Break { hit, .. } => {
+            push_unique_chunk_coord(&mut coords, hit.chunk_coord);
+            for coord in neighbor_chunk_coords(hit.chunk_coord) {
+                push_unique_chunk_coord(&mut coords, coord);
+            }
+        }
+        BlockInteraction::Place {
+            hit, placed_block, ..
+        } => {
+            let placed_coord = world_to_chunk_coord(placed_block.x, placed_block.y, placed_block.z);
+
+            push_unique_chunk_coord(&mut coords, placed_coord);
+            push_unique_chunk_coord(&mut coords, hit.chunk_coord);
+
+            for coord in neighbor_chunk_coords(placed_coord) {
+                push_unique_chunk_coord(&mut coords, coord);
+            }
+            for coord in neighbor_chunk_coords(hit.chunk_coord) {
+                push_unique_chunk_coord(&mut coords, coord);
+            }
+        }
+        BlockInteraction::Miss
+        | BlockInteraction::NoPlaceableBlockSelected
+        | BlockInteraction::InvalidPlacementFace { .. } => {}
+    }
+
+    coords
+}
+
+fn interaction_modified_chunks(interaction: BlockInteraction) -> Vec<ChunkCoord> {
+    match interaction {
+        BlockInteraction::Break { hit, .. } => vec![hit.chunk_coord],
+        BlockInteraction::Place { placed_block, .. } => {
+            vec![world_to_chunk_coord(
+                placed_block.x,
+                placed_block.y,
+                placed_block.z,
+            )]
+        }
+        BlockInteraction::Miss
+        | BlockInteraction::NoPlaceableBlockSelected
+        | BlockInteraction::InvalidPlacementFace { .. } => Vec::new(),
+    }
+}
+
+fn push_unique_chunk_coord(coords: &mut Vec<ChunkCoord>, coord: ChunkCoord) {
+    if !coords.contains(&coord) {
+        coords.push(coord);
+    }
 }
 
 fn mark_streamed_chunk_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> Vec<ChunkCoord> {
@@ -1006,14 +1360,6 @@ fn mark_all_subchunks_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> bool {
 }
 
 const PLAYER_REACH: f32 = 8.0;
-const DEFAULT_MOUSE_SENSITIVITY: f32 = 0.0025;
-const MIN_MOUSE_SENSITIVITY: f32 = 0.0001;
-const MAX_MOUSE_SENSITIVITY: f32 = 0.05;
-const DEFAULT_CHUNK_VIEW_DISTANCE: i32 = 1;
-const MIN_CHUNK_VIEW_DISTANCE: i32 = 1;
-const MAX_CHUNK_VIEW_DISTANCE: i32 = 3;
-const DIRTY_MESH_JOBS_PER_FRAME: usize = 2;
-const CHUNK_GENERATION_JOBS_PER_FRAME: usize = 1;
 const PLAYER_HALF_EXTENTS: [f32; 3] = [0.3, 0.9, 0.3];
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
 const PLAYER_WALK_SPEED: f32 = 5.5;
@@ -1527,9 +1873,23 @@ struct DirtyMeshQueue {
 }
 
 impl DirtyMeshQueue {
+    #[cfg(test)]
     fn enqueue_dirty(&mut self, world: &VoxelWorld) {
         for coord in dirty_window_chunk_coords(world) {
             self.enqueue(coord);
+        }
+    }
+
+    fn enqueue_dirty_within(
+        &mut self,
+        world: &VoxelWorld,
+        center: ChunkCoord,
+        settings: WorldStreamingSettings,
+    ) {
+        for coord in dirty_window_chunk_coords(world) {
+            if chunk_within_render_distance(center, coord, settings) {
+                self.enqueue(coord);
+            }
         }
     }
 
@@ -1537,6 +1897,22 @@ impl DirtyMeshQueue {
         if !self.pending.contains(&coord) {
             self.pending.push_back(coord);
         }
+    }
+
+    fn enqueue_priority<I>(&mut self, coords: I)
+    where
+        I: IntoIterator<Item = ChunkCoord>,
+    {
+        let coords: Vec<ChunkCoord> = coords.into_iter().collect();
+
+        for coord in coords.into_iter().rev() {
+            self.enqueue_front(coord);
+        }
+    }
+
+    fn enqueue_front(&mut self, coord: ChunkCoord) {
+        self.pending.retain(|pending| *pending != coord);
+        self.pending.push_front(coord);
     }
 
     fn pop_dirty(&mut self, world: &VoxelWorld) -> Option<ChunkCoord> {
@@ -1554,7 +1930,6 @@ impl DirtyMeshQueue {
         None
     }
 
-    #[cfg(test)]
     fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -1562,9 +1937,11 @@ impl DirtyMeshQueue {
 
 struct ChunkJobQueue {
     sender: Sender<ChunkJob>,
+    priority_sender: Sender<ChunkJob>,
     receiver: Receiver<ChunkJobResult>,
     pending_generation: HashSet<ChunkCoord>,
     pending_meshes: HashSet<ChunkCoord>,
+    pending_priority_meshes: HashSet<ChunkCoord>,
 }
 
 impl ChunkJobQueue {
@@ -1588,10 +1965,39 @@ impl ChunkJobQueue {
             return false;
         }
 
-        if self.sender.send(ChunkJob::Mesh(input)).is_ok() {
+        if self
+            .sender
+            .send(ChunkJob::Mesh {
+                input,
+                priority: MeshJobPriority::Normal,
+            })
+            .is_ok()
+        {
             true
         } else {
             self.pending_meshes.remove(&coord);
+            false
+        }
+    }
+
+    fn enqueue_mesh_priority(&mut self, input: ChunkMeshInput) -> bool {
+        let coord = input.coord;
+
+        if !self.pending_priority_meshes.insert(coord) {
+            return false;
+        }
+
+        if self
+            .priority_sender
+            .send(ChunkJob::Mesh {
+                input,
+                priority: MeshJobPriority::Priority,
+            })
+            .is_ok()
+        {
+            true
+        } else {
+            self.pending_priority_meshes.remove(&coord);
             false
         }
     }
@@ -1601,7 +2007,15 @@ impl ChunkJobQueue {
     }
 
     fn is_mesh_pending(&self, coord: ChunkCoord) -> bool {
-        self.pending_meshes.contains(&coord)
+        self.pending_meshes.contains(&coord) || self.pending_priority_meshes.contains(&coord)
+    }
+
+    fn normal_mesh_pending_count(&self) -> usize {
+        self.pending_meshes.len()
+    }
+
+    fn generation_pending_count(&self) -> usize {
+        self.pending_generation.len()
     }
 
     fn drain_results(&mut self) -> Vec<ChunkJobResult> {
@@ -1612,8 +2026,13 @@ impl ChunkJobQueue {
                 ChunkJobResult::Generated { coord, .. } => {
                     self.pending_generation.remove(coord);
                 }
-                ChunkJobResult::Meshed { coord, .. } => {
-                    self.pending_meshes.remove(coord);
+                ChunkJobResult::Meshed {
+                    coord, priority, ..
+                } => {
+                    match priority {
+                        MeshJobPriority::Normal => self.pending_meshes.remove(coord),
+                        MeshJobPriority::Priority => self.pending_priority_meshes.remove(coord),
+                    };
                 }
             }
 
@@ -1627,25 +2046,47 @@ impl ChunkJobQueue {
 impl Default for ChunkJobQueue {
     fn default() -> Self {
         let (job_sender, job_receiver) = mpsc::channel();
+        let (priority_job_sender, priority_job_receiver) = mpsc::channel();
         let (result_sender, result_receiver) = mpsc::channel();
 
         thread::Builder::new()
             .name("aq-chunk-worker".to_string())
-            .spawn(move || run_chunk_worker(job_receiver, result_sender))
+            .spawn({
+                let result_sender = result_sender.clone();
+                move || run_chunk_worker(job_receiver, result_sender)
+            })
             .expect("chunk worker thread should start");
+        thread::Builder::new()
+            .name("aq-priority-chunk-worker".to_string())
+            .spawn(move || run_chunk_worker(priority_job_receiver, result_sender))
+            .expect("priority chunk worker thread should start");
 
         Self {
             sender: job_sender,
+            priority_sender: priority_job_sender,
             receiver: result_receiver,
             pending_generation: HashSet::new(),
             pending_meshes: HashSet::new(),
+            pending_priority_meshes: HashSet::new(),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshJobPriority {
+    Normal,
+    Priority,
+}
+
 enum ChunkJob {
-    Generate { seed: u64, coord: ChunkCoord },
-    Mesh(ChunkMeshInput),
+    Generate {
+        seed: u64,
+        coord: ChunkCoord,
+    },
+    Mesh {
+        input: ChunkMeshInput,
+        priority: MeshJobPriority,
+    },
 }
 
 enum ChunkJobResult {
@@ -1657,6 +2098,7 @@ enum ChunkJobResult {
         coord: ChunkCoord,
         revision: u32,
         mesh: MeshData,
+        priority: MeshJobPriority,
     },
 }
 
@@ -1667,10 +2109,11 @@ fn run_chunk_worker(receiver: Receiver<ChunkJob>, sender: Sender<ChunkJobResult>
                 coord,
                 chunk: VoxelWorld::generate_chunk(seed, coord),
             },
-            ChunkJob::Mesh(input) => ChunkJobResult::Meshed {
+            ChunkJob::Mesh { input, priority } => ChunkJobResult::Meshed {
                 coord: input.coord,
                 revision: input.revision,
                 mesh: mesh_chunk_input(&input),
+                priority,
             },
         };
 
@@ -1736,11 +2179,7 @@ impl ChunkStreamingState {
 
 impl Default for ChunkStreamingState {
     fn default() -> Self {
-        Self {
-            settings: WorldStreamingSettings::prototype(),
-            center_chunk: None,
-            pending_loads: VecDeque::new(),
-        }
+        Self::new(GameSettings::default().streaming_settings())
     }
 }
 
@@ -1830,15 +2269,46 @@ impl WindowChunkMesh {
     }
 }
 
-fn build_window_world() -> WindowWorldState {
-    let mut world = VoxelWorld::new(12345);
+fn build_window_world(
+    streaming_settings: WorldStreamingSettings,
+    saved_chunks: &HashMap<ChunkCoord, Chunk>,
+) -> WindowWorldState {
+    let mut world = VoxelWorld::new(config::WORLD_SEED);
     let player_block = camera_block_position(VoxelCamera::looking_at_chunk_origin().position);
+    let initial_radius =
+        config::INITIAL_SYNC_CHUNK_RADIUS.min(streaming_settings.horizontal_load_radius);
+    let initial_vertical_radius =
+        config::INITIAL_SYNC_CHUNK_RADIUS.min(streaming_settings.vertical_load_radius);
+    let initial_settings = WorldStreamingSettings::new(
+        initial_radius,
+        initial_vertical_radius,
+        initial_radius,
+        initial_radius,
+        initial_radius,
+        initial_radius + 1,
+    );
 
-    world.load_chunks_around_block(player_block, WorldStreamingSettings::prototype());
+    world.load_chunks_around_block(player_block, initial_settings);
+    apply_saved_chunks_to_loaded_world(&mut world, saved_chunks);
 
     let meshes = build_window_meshes(&mut world);
 
     WindowWorldState { world, meshes }
+}
+
+fn apply_saved_chunks_to_loaded_world(
+    world: &mut VoxelWorld,
+    saved_chunks: &HashMap<ChunkCoord, Chunk>,
+) {
+    let loaded_coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
+
+    for coord in loaded_coords {
+        let Some(chunk) = saved_chunks.get(&coord) else {
+            continue;
+        };
+
+        world.chunks.insert(coord, chunk.clone());
+    }
 }
 
 fn build_window_meshes(world: &mut VoxelWorld) -> Vec<WindowChunkMesh> {
@@ -1946,7 +2416,7 @@ fn print_window_interaction(interaction: BlockInteraction) {
 fn run_voxel_prototype() {
     println!("Adventure Quest - Rust Voxel Prototype");
 
-    let mut world = VoxelWorld::new(12345);
+    let mut world = VoxelWorld::new(config::WORLD_SEED);
     let player_block = BlockPos::new(0, 40, 0);
     let streaming_settings = WorldStreamingSettings::prototype();
 
@@ -2185,15 +2655,16 @@ mod tests {
         let center = ChunkCoord::new(4, -2, 7);
         let coords = streaming_chunk_coords(center, WorldStreamingSettings::prototype());
 
-        assert_eq!(coords.len(), 27);
+        assert_eq!(coords.len(), 15);
         assert_eq!(coords.front().copied(), Some(center));
-        assert!(coords.contains(&center.offset(1, 1, -1)));
+        assert!(coords.contains(&center.offset(1, 1, 0)));
+        assert!(!coords.contains(&center.offset(1, 1, -1)));
     }
 
     #[test]
     fn chunk_streaming_state_skips_loaded_chunks() {
         let center = ChunkCoord::new(0, 0, 0);
-        let mut state = ChunkStreamingState::default();
+        let mut state = ChunkStreamingState::new(WorldStreamingSettings::prototype());
         let world = world_with_empty_chunks([center]);
 
         assert!(state.update_center(center));
@@ -2201,7 +2672,29 @@ mod tests {
         let first_missing = state.pop_missing(&world);
 
         assert_ne!(first_missing, Some(center));
-        assert_eq!(state.pending_count(), 25);
+        assert_eq!(state.pending_count(), 13);
+    }
+
+    #[test]
+    fn saved_render_distance_is_clamped_to_performance_cap() {
+        let too_low = GameSettings::from_saved(SavedSettings {
+            mouse_sensitivity: config::DEFAULT_MOUSE_SENSITIVITY,
+            render_chunk_distance: 1,
+        });
+        let too_high = GameSettings::from_saved(SavedSettings {
+            mouse_sensitivity: config::DEFAULT_MOUSE_SENSITIVITY,
+            render_chunk_distance: 99,
+        });
+
+        assert_eq!(
+            too_low.chunk_view_distance,
+            config::MIN_RENDER_CHUNK_DISTANCE
+        );
+        assert_eq!(
+            too_high.chunk_view_distance,
+            config::MAX_RENDER_CHUNK_DISTANCE
+        );
+        assert!(too_high.streaming_settings().vertical_load_radius <= 2);
     }
 
     #[test]
@@ -2308,7 +2801,12 @@ mod tests {
         let (result_sender, result_receiver) = mpsc::channel();
         let handle = thread::spawn(move || run_chunk_worker(job_receiver, result_sender));
 
-        job_sender.send(ChunkJob::Mesh(input)).unwrap();
+        job_sender
+            .send(ChunkJob::Mesh {
+                input,
+                priority: MeshJobPriority::Normal,
+            })
+            .unwrap();
 
         let result = result_receiver
             .recv_timeout(Duration::from_secs(2))
@@ -2319,10 +2817,12 @@ mod tests {
                 coord: result_coord,
                 revision: result_revision,
                 mesh,
+                priority,
             } => {
                 assert_eq!(result_coord, coord);
                 assert_eq!(result_revision, revision);
                 assert_eq!(mesh.visible_face_count, 6);
+                assert_eq!(priority, MeshJobPriority::Normal);
             }
             ChunkJobResult::Generated { .. } => panic!("expected mesh result"),
         }

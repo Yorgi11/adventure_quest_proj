@@ -89,6 +89,34 @@ impl Chunk {
         }
     }
 
+    pub fn from_blocks(
+        coord: ChunkCoord,
+        blocks: Box<[BlockId; CHUNK_VOLUME]>,
+        revision: u32,
+    ) -> Self {
+        let mut chunk = Self {
+            coord,
+            blocks,
+
+            solid_block_count: 0,
+            subchunk_solid_counts: [0; SUBCHUNK_COUNT],
+
+            subchunk_occupancy_mask: 0,
+            subchunk_dirty_mask: 0,
+            subchunk_visible_mask: 0,
+            subchunk_full_solid_mask: 0,
+
+            revision,
+        };
+
+        chunk.rebuild_metadata_from_blocks();
+        chunk
+    }
+
+    pub fn blocks(&self) -> &[BlockId; CHUNK_VOLUME] {
+        &self.blocks
+    }
+
     #[inline(always)]
     pub fn get_block(&self, x: usize, y: usize, z: usize) -> BlockId {
         self.blocks[block_index(x, y, z)]
@@ -172,6 +200,36 @@ impl Chunk {
     pub fn is_subchunk_full(&self, sub: usize) -> bool {
         self.subchunk_solid_counts[sub] as usize == SUBCHUNK_VOLUME
     }
+
+    fn rebuild_metadata_from_blocks(&mut self) {
+        self.solid_block_count = 0;
+        self.subchunk_solid_counts = [0; SUBCHUNK_COUNT];
+        self.subchunk_occupancy_mask = 0;
+        self.subchunk_dirty_mask = 0;
+        self.subchunk_visible_mask = 0;
+        self.subchunk_full_solid_mask = 0;
+
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    if self.get_block(x, y, z) == AIR_BLOCK {
+                        continue;
+                    }
+
+                    let sub = subchunk_index(x, y, z);
+                    self.solid_block_count += 1;
+                    self.subchunk_solid_counts[sub] += 1;
+                    self.subchunk_occupancy_mask |= subchunk_bit(sub);
+                }
+            }
+        }
+
+        for sub in 0..SUBCHUNK_COUNT {
+            if self.subchunk_solid_counts[sub] as usize == SUBCHUNK_VOLUME {
+                self.subchunk_full_solid_mask |= subchunk_bit(sub);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +280,26 @@ mod tests {
         assert_eq!(chunk.solid_block_count, 0);
         assert_eq!(chunk.subchunk_dirty_mask, 0);
         assert_eq!(chunk.revision, 0);
+    }
+
+    #[test]
+    fn chunk_from_blocks_rebuilds_counts_and_masks() {
+        let coord = ChunkCoord::new(1, 2, 3);
+        let mut blocks = Box::new([AIR_BLOCK; CHUNK_VOLUME]);
+        blocks[block_index(0, 0, 0)] = STONE_BLOCK;
+        blocks[block_index(16, 16, 16)] = DIRT_BLOCK;
+
+        let chunk = Chunk::from_blocks(coord, blocks, 7);
+
+        assert_eq!(chunk.coord, coord);
+        assert_eq!(chunk.revision, 7);
+        assert_eq!(chunk.solid_block_count, 2);
+        assert_eq!(chunk.subchunk_solid_counts[0], 1);
+        assert_eq!(chunk.subchunk_solid_counts[7], 1);
+        assert_eq!(
+            chunk.subchunk_occupancy_mask,
+            subchunk_bit(0) | subchunk_bit(7)
+        );
+        assert_eq!(chunk.subchunk_dirty_mask, 0);
     }
 }
