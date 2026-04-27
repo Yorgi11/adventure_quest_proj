@@ -18,6 +18,7 @@ const CHUNK_SAVE_MAGIC: &[u8; 8] = b"AQCHNK1\0";
 pub struct SavedSettings {
     pub mouse_sensitivity: f32,
     pub render_chunk_distance: i32,
+    pub fov_degrees: f32,
 }
 
 pub fn default_save_dir() -> PathBuf {
@@ -35,6 +36,7 @@ pub fn load_settings(save_dir: &Path) -> io::Result<Option<SavedSettings>> {
 
     let mut mouse_sensitivity = None;
     let mut render_chunk_distance = None;
+    let mut fov_degrees = None;
 
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
@@ -45,6 +47,7 @@ pub fn load_settings(save_dir: &Path) -> io::Result<Option<SavedSettings>> {
         match key.trim() {
             "mouse_sensitivity" => mouse_sensitivity = value.trim().parse::<f32>().ok(),
             "render_chunk_distance" => render_chunk_distance = value.trim().parse::<i32>().ok(),
+            "fov_degrees" => fov_degrees = value.trim().parse::<f32>().ok(),
             _ => {}
         }
     }
@@ -53,6 +56,7 @@ pub fn load_settings(save_dir: &Path) -> io::Result<Option<SavedSettings>> {
         mouse_sensitivity: mouse_sensitivity.unwrap_or(config::DEFAULT_MOUSE_SENSITIVITY),
         render_chunk_distance: render_chunk_distance
             .unwrap_or(config::DEFAULT_RENDER_CHUNK_DISTANCE),
+        fov_degrees: fov_degrees.unwrap_or(config::DEFAULT_FOV_DEGREES),
     }))
 }
 
@@ -66,6 +70,7 @@ pub fn save_settings(save_dir: &Path, settings: SavedSettings) -> io::Result<()>
         "render_chunk_distance={}",
         settings.render_chunk_distance
     )?;
+    writeln!(file, "fov_degrees={:.2}", settings.fov_degrees)?;
 
     Ok(())
 }
@@ -243,6 +248,7 @@ mod tests {
         let settings = SavedSettings {
             mouse_sensitivity: 0.004,
             render_chunk_distance: 4,
+            fov_degrees: 90.0,
         };
 
         save_settings(&dir, settings).unwrap();

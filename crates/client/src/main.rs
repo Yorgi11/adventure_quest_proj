@@ -11,18 +11,23 @@ use std::{
 
 mod config;
 mod persistence;
+mod tool_config;
 
 use foundation::{BlockPos, ChunkCoord};
 use gameplay::{
-    break_target_block, place_selected_block, BlockInteraction, Hotbar, HOTBAR_SLOT_COUNT,
+    break_hit_block, break_target_block, place_selected_block, BlockInteraction, Hotbar,
+    HOTBAR_SLOT_COUNT,
 };
 use meshing::{mesh_chunk, mesh_chunk_input, mesh_dirty_subchunks, ChunkMeshInput, MeshData};
-use physics::{move_aabb_through_voxels, raycast_blocks};
+use physics::{aabb_has_ground_support, move_aabb_through_voxels, raycast_blocks};
 use renderer::{
-    ChunkMeshUpload, ClearRenderer, RendererOptions, UiOverlay, UiOverlayItem, UiRect, UiText,
-    VoxelCamera,
+    ChunkMeshUpload, ChunkVisibility, ClearRenderer, RendererOptions, UiOverlay, UiOverlayItem,
+    UiRect, UiText, UiTextureRect, VoxelCamera,
 };
-use voxels::{world_to_chunk_coord, Chunk, SUBCHUNK_COUNT};
+use voxels::{
+    block_break_hp, block_color_rgba, block_hotbar_uvs, block_label, world_to_chunk_coord, BlockId,
+    Chunk, AIR_BLOCK, CHUNK_SIZE, SUBCHUNK_COUNT,
+};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
@@ -38,9 +43,8 @@ use persistence::SavedSettings;
 fn main() -> Result<(), Box<dyn Error>> {
     let options = ClientOptions::from_args(std::env::args().skip(1));
 
-    run_voxel_prototype();
-
     if options.no_window {
+        run_voxel_prototype();
         return Ok(());
     }
 
@@ -89,6 +93,7 @@ enum AppScreen {
     #[default]
     MainMenu,
     WorldList,
+    LoadingWorld,
     Settings,
     PauseMenu,
     InGame,
@@ -105,18 +110,21 @@ enum MenuAction {
     QuitGame,
     MouseSensitivity,
     ChunkViewDistance,
+    Fov,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsField {
     MouseSensitivity,
     ChunkViewDistance,
+    Fov,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GameSettings {
     mouse_sensitivity: f32,
     chunk_view_distance: i32,
+    fov_degrees: f32,
 }
 
 impl GameSettings {
@@ -125,9 +133,8 @@ impl GameSettings {
             config::MIN_RENDER_CHUNK_DISTANCE,
             config::MAX_RENDER_CHUNK_DISTANCE,
         );
-        let vertical_radius = radius.min(config::MAX_VERTICAL_RENDER_CHUNK_DISTANCE);
 
-        WorldStreamingSettings::new(radius, vertical_radius, radius, radius, radius, radius + 1)
+        WorldStreamingSettings::new(radius, radius, radius, radius, radius, radius + 1)
     }
 
     fn from_saved(settings: SavedSettings) -> Self {
@@ -139,6 +146,9 @@ impl GameSettings {
                 config::MIN_RENDER_CHUNK_DISTANCE,
                 config::MAX_RENDER_CHUNK_DISTANCE,
             ),
+            fov_degrees: settings
+                .fov_degrees
+                .clamp(config::MIN_FOV_DEGREES, config::MAX_FOV_DEGREES),
         }
     }
 
@@ -146,6 +156,7 @@ impl GameSettings {
         SavedSettings {
             mouse_sensitivity: self.mouse_sensitivity,
             render_chunk_distance: self.chunk_view_distance,
+            fov_degrees: self.fov_degrees,
         }
     }
 }
@@ -155,6 +166,7 @@ impl Default for GameSettings {
         Self {
             mouse_sensitivity: config::DEFAULT_MOUSE_SENSITIVITY,
             chunk_view_distance: config::DEFAULT_RENDER_CHUNK_DISTANCE,
+            fov_degrees: config::DEFAULT_FOV_DEGREES,
         }
     }
 }
@@ -163,6 +175,7 @@ impl Default for GameSettings {
 struct SettingsInputs {
     mouse_sensitivity: String,
     chunk_view_distance: String,
+    fov_degrees: String,
 }
 
 impl SettingsInputs {
@@ -170,6 +183,7 @@ impl SettingsInputs {
         Self {
             mouse_sensitivity: format!("{:.4}", settings.mouse_sensitivity),
             chunk_view_distance: settings.chunk_view_distance.to_string(),
+            fov_degrees: format!("{:.0}", settings.fov_degrees),
         }
     }
 }
@@ -187,6 +201,9 @@ struct AdventureQuestApp {
     world: Option<VoxelWorld>,
     player: PlayerController,
     hotbar: Hotbar,
+    block_breaking: BlockBreakState,
+    visible_break_progress: Option<u8>,
+    visible_break_outline: Option<BlockPos>,
     noclip_enabled: bool,
     mouse_look_active: bool,
     mouse_position: PhysicalPosition<f64>,
@@ -201,6 +218,7 @@ struct AdventureQuestApp {
     dirty_mesh_queue: DirtyMeshQueue,
     streaming: ChunkStreamingState,
     chunk_jobs: ChunkJobQueue,
+    world_loading: Option<WorldLoadState>,
 }
 
 impl AdventureQuestApp {
@@ -208,20 +226,24 @@ impl AdventureQuestApp {
         let save_dir = persistence::default_save_dir();
         let settings = load_saved_game_settings(&save_dir);
         let saved_chunks = load_saved_world_chunks(&save_dir);
+        let camera = camera_with_settings(VoxelCamera::looking_at_chunk_origin(), settings);
 
         Self {
             window: None,
             renderer: None,
             screen: AppScreen::MainMenu,
             input: InputState::default(),
-            camera: VoxelCamera::looking_at_chunk_origin(),
+            camera,
             last_frame: None,
             show_fps: options.show_fps,
             renderer_options: options.renderer,
             fps_counter: FpsCounter::default(),
             world: None,
-            player: PlayerController::from_camera(VoxelCamera::looking_at_chunk_origin()),
+            player: PlayerController::from_camera(camera),
             hotbar: Hotbar::starter(),
+            block_breaking: BlockBreakState::default(),
+            visible_break_progress: None,
+            visible_break_outline: None,
             noclip_enabled: false,
             mouse_look_active: false,
             mouse_position: PhysicalPosition::new(0.0, 0.0),
@@ -236,6 +258,7 @@ impl AdventureQuestApp {
             dirty_mesh_queue: DirtyMeshQueue::default(),
             streaming: ChunkStreamingState::default(),
             chunk_jobs: ChunkJobQueue::default(),
+            world_loading: None,
         }
     }
 }
@@ -334,6 +357,8 @@ impl ApplicationHandler for AdventureQuestApp {
                         self.capture_mouse(&window);
                     }
                 } else {
+                    self.input.breaking = false;
+                    self.reset_block_breaking();
                     self.release_mouse(&window);
                 }
             }
@@ -341,6 +366,10 @@ impl ApplicationHandler for AdventureQuestApp {
                 self.mouse_position = position;
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if self.screen == AppScreen::LoadingWorld {
+                    return;
+                }
+
                 if self.screen != AppScreen::InGame {
                     self.handle_menu_keyboard(event_loop, &window, &event);
                     return;
@@ -359,20 +388,31 @@ impl ApplicationHandler for AdventureQuestApp {
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
-                ..
-            } => {
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+
                 if self.screen == AppScreen::InGame {
-                    self.capture_mouse(&window);
+                    if pressed {
+                        self.capture_mouse(&window);
+                    }
 
                     match button {
-                        MouseButton::Left => self.interact_with_target(BlockAction::Break),
-                        MouseButton::Right => self.interact_with_target(BlockAction::Place),
+                        MouseButton::Left => {
+                            self.input.breaking = pressed;
+
+                            if !pressed {
+                                self.reset_block_breaking();
+                            }
+                        }
+                        MouseButton::Right if pressed => {
+                            self.reset_block_breaking();
+                            self.place_with_target();
+                        }
                         _ => {}
                     }
-                } else if button == MouseButton::Left {
+                } else if self.screen == AppScreen::LoadingWorld {
+                    return;
+                } else if button == MouseButton::Left && pressed {
                     self.handle_menu_click(event_loop, &window);
                 }
             }
@@ -380,16 +420,24 @@ impl ApplicationHandler for AdventureQuestApp {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }
-                self.refresh_menu_overlay();
+                self.refresh_active_overlay();
             }
             WindowEvent::RedrawRequested => {
-                if self.screen == AppScreen::InGame {
-                    self.advance_player();
-                    self.process_completed_chunk_jobs();
-                    self.process_chunk_streaming();
-                    self.schedule_dirty_mesh_jobs();
-                } else {
-                    self.last_frame = None;
+                match self.screen {
+                    AppScreen::InGame => {
+                        let dt = self.advance_player();
+                        self.advance_block_breaking(dt);
+                        self.process_completed_chunk_jobs();
+                        self.process_chunk_streaming();
+                        self.schedule_dirty_mesh_jobs();
+                    }
+                    AppScreen::LoadingWorld => {
+                        self.last_frame = None;
+                        self.process_world_loading(&window);
+                    }
+                    _ => {
+                        self.last_frame = None;
+                    }
                 }
 
                 let fps_update = if self.show_fps {
@@ -420,7 +468,7 @@ impl ApplicationHandler for AdventureQuestApp {
 }
 
 impl AdventureQuestApp {
-    fn advance_player(&mut self) {
+    fn advance_player(&mut self) -> f32 {
         let now = Instant::now();
         let dt = self
             .last_frame
@@ -429,26 +477,32 @@ impl AdventureQuestApp {
             .unwrap_or(0.0);
 
         if dt == 0.0 {
-            return;
+            return 0.0;
         }
 
         if self.noclip_enabled {
             self.advance_noclip_camera(dt);
             self.player = PlayerController::from_camera(self.camera);
-            return;
+            return dt;
         }
 
         let Some(world) = self.world.as_ref() else {
-            return;
+            return dt;
         };
 
         self.player
             .step(world, self.camera.yaw_radians, self.input, dt);
         self.camera.position = self.player.camera_position();
+
+        dt
     }
 
     fn advance_noclip_camera(&mut self, dt: f32) {
-        let movement_speed = if self.input.fast { 42.0 } else { 18.0 };
+        let movement_speed = if self.input.fast {
+            config::NOCLIP_FAST_SPEED
+        } else {
+            config::NOCLIP_WALK_SPEED
+        };
 
         let forward = self.input.forward_axis() * movement_speed * dt;
         let right = self.input.right_axis() * movement_speed * dt;
@@ -571,6 +625,10 @@ impl AdventureQuestApp {
                 self.active_settings_field = Some(SettingsField::ChunkViewDistance);
                 self.refresh_menu_overlay();
             }
+            MenuAction::Fov => {
+                self.active_settings_field = Some(SettingsField::Fov);
+                self.refresh_menu_overlay();
+            }
         }
     }
 
@@ -601,6 +659,7 @@ impl AdventureQuestApp {
 
         match self.screen {
             AppScreen::MainMenu => {}
+            AppScreen::LoadingWorld => {}
             AppScreen::PauseMenu => self.resume_game(window),
             AppScreen::Settings => {
                 self.apply_settings_from_inputs();
@@ -627,6 +686,7 @@ impl AdventureQuestApp {
                 KeyCode::Tab => {
                     self.active_settings_field = Some(match self.active_settings_field {
                         Some(SettingsField::MouseSensitivity) => SettingsField::ChunkViewDistance,
+                        Some(SettingsField::ChunkViewDistance) => SettingsField::Fov,
                         _ => SettingsField::MouseSensitivity,
                     });
                     return true;
@@ -668,12 +728,10 @@ impl AdventureQuestApp {
                 continue;
             };
 
-            if field == SettingsField::MouseSensitivity && character == '.' && target.contains('.')
+            if matches!(field, SettingsField::MouseSensitivity | SettingsField::Fov)
+                && character == '.'
+                && target.contains('.')
             {
-                continue;
-            }
-
-            if target.len() >= settings_input_limit(field) {
                 continue;
             }
 
@@ -692,37 +750,50 @@ impl AdventureQuestApp {
             Some(SettingsField::ChunkViewDistance) => {
                 Some(&mut self.settings_inputs.chunk_view_distance)
             }
+            Some(SettingsField::Fov) => Some(&mut self.settings_inputs.fov_degrees),
             None => None,
         }
     }
 
     fn apply_settings_from_inputs(&mut self) {
-        let mouse_sensitivity = self
-            .settings_inputs
-            .mouse_sensitivity
-            .parse::<f32>()
-            .ok()
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(self.settings.mouse_sensitivity)
-            .clamp(config::MIN_MOUSE_SENSITIVITY, config::MAX_MOUSE_SENSITIVITY);
-        let chunk_view_distance = self
-            .settings_inputs
-            .chunk_view_distance
-            .parse::<i32>()
-            .unwrap_or(self.settings.chunk_view_distance)
-            .clamp(
-                config::MIN_RENDER_CHUNK_DISTANCE,
-                config::MAX_RENDER_CHUNK_DISTANCE,
-            );
+        let mouse_sensitivity = parse_clamped_f32_setting(
+            &self.settings_inputs.mouse_sensitivity,
+            self.settings.mouse_sensitivity,
+            config::MIN_MOUSE_SENSITIVITY,
+            config::MAX_MOUSE_SENSITIVITY,
+        );
+        let chunk_view_distance = parse_clamped_i32_setting(
+            &self.settings_inputs.chunk_view_distance,
+            self.settings.chunk_view_distance,
+            config::MIN_RENDER_CHUNK_DISTANCE,
+            config::MAX_RENDER_CHUNK_DISTANCE,
+        );
+        let fov_degrees = parse_clamped_f32_setting(
+            &self.settings_inputs.fov_degrees,
+            self.settings.fov_degrees,
+            config::MIN_FOV_DEGREES,
+            config::MAX_FOV_DEGREES,
+        );
 
         self.settings = GameSettings {
             mouse_sensitivity,
             chunk_view_distance,
+            fov_degrees,
         };
         self.settings_inputs = SettingsInputs::from_settings(self.settings);
         self.streaming
             .set_settings(self.settings.streaming_settings());
+        self.apply_camera_settings();
         self.save_settings();
+    }
+
+    fn apply_camera_settings(&mut self) {
+        self.camera.fov_y_radians = self.settings.fov_degrees.to_radians();
+        self.camera.far = camera_far_plane(self.settings);
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_camera(self.camera);
+        }
     }
 
     fn save_settings(&self) {
@@ -770,9 +841,10 @@ impl AdventureQuestApp {
     fn start_existing_world(&mut self, window: &Window) {
         self.release_mouse(window);
         self.saved_chunks = load_saved_world_chunks(&self.save_dir);
-        self.camera = VoxelCamera::looking_at_chunk_origin();
+        self.camera = camera_with_settings(VoxelCamera::looking_at_chunk_origin(), self.settings);
         self.player = PlayerController::from_camera(self.camera);
         self.input = InputState::default();
+        self.reset_block_breaking();
         self.last_frame = None;
         self.noclip_enabled = false;
         self.world_save_dirty = false;
@@ -780,34 +852,97 @@ impl AdventureQuestApp {
         self.dirty_mesh_queue = DirtyMeshQueue::default();
         self.streaming = ChunkStreamingState::new(self.settings.streaming_settings());
         self.chunk_jobs = ChunkJobQueue::default();
-
-        let window_world =
-            build_window_world(self.settings.streaming_settings(), &self.saved_chunks);
+        self.world_loading = Some(WorldLoadState::new(
+            self.settings.streaming_settings(),
+            self.camera,
+            self.renderer
+                .as_ref()
+                .map(ClearRenderer::size)
+                .unwrap_or_else(|| PhysicalSize::new(1280, 720)),
+        ));
 
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_chunk_meshes();
             renderer.set_camera(self.camera);
-            renderer.set_ui_overlay(UiOverlay::default());
-            renderer.set_crosshair_enabled(true);
-            renderer.upload_chunk_meshes(window_world.meshes.iter().map(WindowChunkMesh::upload));
-
-            if window_world.meshes.is_empty() {
-                eprintln!("No chunk meshes were available for the first rendered frame");
-            } else {
-                println!(
-                    "Uploaded {} chunk meshes to renderer ({} indices)",
-                    renderer.mesh_count(),
-                    renderer.index_count()
-                );
-            }
+            renderer.set_crosshair_enabled(false);
+            renderer.set_ui_overlay(build_loading_overlay(0.0, renderer.size()));
         }
 
-        self.world = Some(window_world.world);
+        self.screen = AppScreen::LoadingWorld;
+        window.request_redraw();
+    }
+
+    fn process_world_loading(&mut self, window: &Window) {
+        let Some(loading) = self.world_loading.as_mut() else {
+            return;
+        };
+
+        loading.generate_chunks(&self.saved_chunks);
+
+        if loading.is_generation_complete() && !loading.meshing_started() {
+            let visibility = self
+                .renderer
+                .as_ref()
+                .map(|renderer| renderer.chunk_visibility(self.camera))
+                .unwrap_or_else(ChunkVisibility::all);
+            loading.start_meshing(self.camera, visibility, self.settings.streaming_settings());
+        }
+
+        loading.schedule_mesh_jobs(&mut self.chunk_jobs);
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            for result in self
+                .chunk_jobs
+                .drain_results(config::LOADING_CHUNK_JOB_RESULTS_PROCESSED_PER_FRAME)
+            {
+                match result {
+                    ChunkJobResult::Meshed {
+                        coord,
+                        revision,
+                        mesh,
+                        ..
+                    } => {
+                        apply_mesh_job_result(
+                            &mut loading.world,
+                            renderer,
+                            &mut self.dirty_mesh_queue,
+                            coord,
+                            revision,
+                            mesh,
+                        );
+                        loading.record_mesh_result();
+                    }
+                    ChunkJobResult::Generated { .. } => {}
+                }
+            }
+
+            renderer.set_ui_overlay(build_loading_overlay(loading.progress(), renderer.size()));
+        }
+
+        if !loading.is_complete(&self.chunk_jobs) {
+            return;
+        }
+
+        let Some(loading) = self.world_loading.take() else {
+            return;
+        };
+
+        self.world = Some(loading.world);
         self.screen = AppScreen::InGame;
+        self.streaming = ChunkStreamingState::new(self.settings.streaming_settings());
+        self.last_frame = None;
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_crosshair_enabled(true);
+        }
+
+        self.refresh_gameplay_overlay();
         self.capture_mouse(window);
     }
 
     fn open_pause_menu(&mut self, window: &Window) {
         self.input = InputState::default();
+        self.reset_block_breaking();
         self.last_frame = None;
         self.active_settings_field = None;
         self.screen = AppScreen::PauseMenu;
@@ -822,15 +957,12 @@ impl AdventureQuestApp {
         }
 
         self.input = InputState::default();
+        self.reset_block_breaking();
         self.last_frame = None;
         self.active_settings_field = None;
         self.screen = AppScreen::InGame;
 
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_ui_overlay(UiOverlay::default());
-            renderer.set_crosshair_enabled(true);
-        }
-
+        self.refresh_gameplay_overlay();
         self.capture_mouse(window);
     }
 
@@ -838,7 +970,9 @@ impl AdventureQuestApp {
         self.save_current_world_if_dirty();
         self.release_mouse(window);
         self.world = None;
+        self.world_loading = None;
         self.input = InputState::default();
+        self.reset_block_breaking();
         self.last_frame = None;
         self.noclip_enabled = false;
         self.active_settings_field = None;
@@ -858,8 +992,32 @@ impl AdventureQuestApp {
         self.refresh_menu_overlay();
     }
 
-    fn refresh_menu_overlay(&mut self) {
+    fn refresh_active_overlay(&mut self) {
         if self.screen == AppScreen::InGame {
+            self.refresh_gameplay_overlay();
+        } else if self.screen == AppScreen::LoadingWorld {
+            self.refresh_loading_overlay();
+        } else {
+            self.refresh_menu_overlay();
+        }
+    }
+
+    fn refresh_loading_overlay(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let progress = self
+            .world_loading
+            .as_ref()
+            .map(WorldLoadState::progress)
+            .unwrap_or(0.0);
+
+        renderer.set_crosshair_enabled(false);
+        renderer.set_ui_overlay(build_loading_overlay(progress, renderer.size()));
+    }
+
+    fn refresh_menu_overlay(&mut self) {
+        if matches!(self.screen, AppScreen::InGame | AppScreen::LoadingWorld) {
             return;
         }
 
@@ -880,6 +1038,23 @@ impl AdventureQuestApp {
         }
     }
 
+    fn refresh_gameplay_overlay(&mut self) {
+        if self.screen != AppScreen::InGame {
+            return;
+        }
+
+        let Some(size) = self.renderer.as_ref().map(ClearRenderer::size) else {
+            return;
+        };
+        let overlay =
+            build_gameplay_overlay(&self.hotbar, self.visible_break_progress_ratio(), size);
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_crosshair_enabled(true);
+            renderer.set_ui_overlay(overlay);
+        }
+    }
+
     fn select_hotbar_key(&mut self, key: KeyCode) -> bool {
         let Some(slot) = hotbar_slot_for_key(key) else {
             return false;
@@ -893,12 +1068,15 @@ impl AdventureQuestApp {
             );
         }
 
+        self.refresh_gameplay_overlay();
+
         true
     }
 
     fn toggle_noclip(&mut self) {
         self.noclip_enabled = !self.noclip_enabled;
         self.player = PlayerController::from_camera(self.camera);
+        self.reset_block_breaking();
 
         if self.noclip_enabled {
             println!("Noclip enabled");
@@ -907,24 +1085,106 @@ impl AdventureQuestApp {
         }
     }
 
-    fn interact_with_target(&mut self, action: BlockAction) {
+    fn place_with_target(&mut self) {
         let Some(world) = self.world.as_mut() else {
             return;
         };
 
         let origin = self.camera.position;
         let direction = self.camera.forward_direction();
-        let result = match action {
-            BlockAction::Break => break_target_block(world, origin, direction, PLAYER_REACH),
-            BlockAction::Place => {
-                place_selected_block(world, &self.hotbar, origin, direction, PLAYER_REACH)
-            }
+        let result = place_selected_block(world, &self.hotbar, origin, direction, PLAYER_REACH);
+
+        self.handle_block_interaction_result(result, true);
+    }
+
+    fn reset_block_breaking(&mut self) {
+        self.block_breaking.reset();
+        self.set_visible_break_outline(None);
+        self.set_visible_break_progress(None);
+    }
+
+    fn set_visible_break_outline(&mut self, block: Option<BlockPos>) {
+        if self.visible_break_outline == block {
+            return;
+        }
+
+        self.visible_break_outline = block;
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_block_outline(block);
+        }
+    }
+
+    fn set_visible_break_progress(&mut self, progress: Option<f32>) {
+        let visible_progress = progress.map(quantize_break_progress);
+
+        if self.visible_break_progress == visible_progress {
+            return;
+        }
+
+        self.visible_break_progress = visible_progress;
+        self.refresh_gameplay_overlay();
+    }
+
+    fn visible_break_progress_ratio(&self) -> Option<f32> {
+        self.visible_break_progress
+            .map(|progress| progress as f32 / 100.0)
+    }
+
+    fn advance_block_breaking(&mut self, dt: f32) {
+        if !self.input.breaking {
+            self.reset_block_breaking();
+            return;
+        }
+
+        if dt <= 0.0 {
+            return;
+        }
+
+        let Some(world) = self.world.as_ref() else {
+            self.reset_block_breaking();
+            return;
         };
+
+        let Some(hit) = raycast_blocks(
+            world,
+            self.camera.position,
+            self.camera.forward_direction(),
+            PLAYER_REACH,
+        ) else {
+            self.reset_block_breaking();
+            return;
+        };
+
+        let block_hp = block_break_hp(hit.block_id);
+        let damage = tool_config::UNARMED_BREAK_DAMAGE_PER_SECOND * dt;
+        let broke_block = self.block_breaking.apply_damage(hit, block_hp, damage);
+
+        self.set_visible_break_outline(Some(hit.world_block));
+
+        if !broke_block {
+            self.set_visible_break_progress(self.block_breaking.progress_ratio(block_hp));
+            return;
+        }
+
+        let Some(world) = self.world.as_mut() else {
+            self.reset_block_breaking();
+            return;
+        };
+        let result = break_hit_block(world, hit);
+
+        self.reset_block_breaking();
+        self.handle_block_interaction_result(result, false);
+    }
+
+    fn handle_block_interaction_result(&mut self, result: BlockInteraction, print_miss: bool) {
         let changed_blocks = changed_block_count(result);
         let priority_chunks = interaction_priority_chunks(result);
         let modified_chunks = interaction_modified_chunks(result);
 
-        print_window_interaction(result);
+        if print_miss || changed_blocks > 0 {
+            print_window_interaction(result);
+        }
 
         if changed_blocks == 0 {
             return;
@@ -934,6 +1194,10 @@ impl AdventureQuestApp {
         self.modified_chunk_coords.extend(modified_chunks);
         self.dirty_mesh_queue
             .enqueue_priority(priority_chunks.iter().copied());
+
+        let Some(world) = self.world.as_ref() else {
+            return;
+        };
 
         for coord in priority_chunks {
             let Some(input) = ChunkMeshInput::from_world(world, coord) else {
@@ -945,6 +1209,8 @@ impl AdventureQuestApp {
     }
 
     fn process_completed_chunk_jobs(&mut self) {
+        let center = camera_chunk_coord(self.camera);
+        let settings = self.settings.streaming_settings();
         let Some(world) = self.world.as_mut() else {
             return;
         };
@@ -952,7 +1218,10 @@ impl AdventureQuestApp {
             return;
         };
 
-        for result in self.chunk_jobs.drain_results() {
+        for result in self
+            .chunk_jobs
+            .drain_results(config::MAX_CHUNK_JOB_RESULTS_PROCESSED_PER_FRAME)
+        {
             match result {
                 ChunkJobResult::Generated { coord, chunk } => {
                     let chunk = self.saved_chunks.get(&coord).cloned().unwrap_or(chunk);
@@ -969,11 +1238,7 @@ impl AdventureQuestApp {
                     mesh,
                     ..
                 } => {
-                    if !chunk_within_render_distance(
-                        camera_chunk_coord(self.camera),
-                        coord,
-                        self.settings.streaming_settings(),
-                    ) {
+                    if !chunk_is_render_candidate(world, center, coord, settings) {
                         continue;
                     }
 
@@ -991,14 +1256,18 @@ impl AdventureQuestApp {
     }
 
     fn schedule_dirty_mesh_jobs(&mut self) {
-        let Some(world) = self.world.as_mut() else {
+        let Some(world) = self.world.as_ref() else {
             return;
         };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let visibility = renderer.chunk_visibility(self.camera);
         let center = camera_chunk_coord(self.camera);
         let settings = self.settings.streaming_settings();
 
         self.dirty_mesh_queue
-            .enqueue_dirty_within(world, center, settings);
+            .prioritize(world, self.camera, visibility, center, settings);
 
         for _ in 0..config::DIRTY_MESH_JOBS_PER_FRAME {
             if self.chunk_jobs.normal_mesh_pending_count() >= config::MAX_PENDING_NORMAL_MESH_JOBS {
@@ -1009,8 +1278,13 @@ impl AdventureQuestApp {
                 break;
             };
 
-            if !chunk_within_render_distance(center, coord, settings) {
+            if !chunk_is_render_candidate(world, center, coord, settings) {
                 continue;
+            }
+
+            if !chunk_is_visible_render_candidate(world, visibility, center, coord, settings) {
+                self.dirty_mesh_queue.enqueue(coord);
+                break;
             }
 
             if self.chunk_jobs.is_mesh_pending(coord) {
@@ -1031,12 +1305,26 @@ impl AdventureQuestApp {
         };
 
         let center = camera_chunk_coord(self.camera);
-        if self.streaming.update_center(center) {
-            println!("Streaming around chunk {:?}", center);
+        let viewport = self
+            .renderer
+            .as_ref()
+            .map(ClearRenderer::size)
+            .unwrap_or_else(|| PhysicalSize::new(1280, 720));
+        let view_changed = self.streaming.update_view(center, self.camera, viewport);
+
+        if view_changed {
+            self.dirty_mesh_queue.request_prioritize();
         }
 
         self.prune_loaded_chunks();
-        self.sync_render_radius();
+
+        let render_mesh_over_budget = self.renderer.as_ref().is_some_and(|renderer| {
+            renderer.chunk_mesh_count() > config::MAX_RENDERED_CHUNK_MESHES
+        });
+
+        if view_changed || render_mesh_over_budget {
+            self.sync_render_radius();
+        }
 
         for _ in 0..config::CHUNK_GENERATION_JOBS_PER_FRAME {
             if self.chunk_jobs.generation_pending_count() >= config::MAX_PENDING_GENERATION_JOBS {
@@ -1046,7 +1334,7 @@ impl AdventureQuestApp {
             let Some(world) = self.world.as_ref() else {
                 break;
             };
-            let Some(coord) = self.streaming.pop_missing(world) else {
+            let Some(coord) = self.streaming.pop_missing_visible(world, self.camera) else {
                 break;
             };
 
@@ -1097,24 +1385,33 @@ impl AdventureQuestApp {
     fn sync_render_radius(&mut self) {
         let center = camera_chunk_coord(self.camera);
         let settings = self.settings.streaming_settings();
-        let rendered_coords: Vec<ChunkCoord> = self
-            .renderer
-            .as_ref()
-            .map(|renderer| renderer.chunk_mesh_info().map(|info| info.coord).collect())
-            .unwrap_or_default();
 
         let mut retained_rendered_coords = Vec::new();
         let mut meshes_to_remove = Vec::new();
 
-        for coord in rendered_coords {
-            if chunk_within_render_distance(center, coord, settings) {
-                retained_rendered_coords.push(coord);
-            } else {
-                meshes_to_remove.push(coord);
-            }
-        }
+        {
+            let Some(world) = self.world.as_ref() else {
+                return;
+            };
+            let Some(renderer) = self.renderer.as_ref() else {
+                return;
+            };
+            let visibility = renderer.chunk_visibility(self.camera);
+            let rendered_coords: Vec<ChunkCoord> =
+                renderer.chunk_mesh_info().map(|info| info.coord).collect();
 
-        retained_rendered_coords.sort_by_key(|coord| chunk_distance_key(center, *coord));
+            for coord in rendered_coords {
+                if chunk_is_render_candidate(world, center, coord, settings) {
+                    retained_rendered_coords.push(coord);
+                } else {
+                    meshes_to_remove.push(coord);
+                }
+            }
+
+            retained_rendered_coords.sort_by_cached_key(|coord| {
+                chunk_render_priority_key(world, self.camera, visibility, center, *coord, settings)
+            });
+        }
 
         if retained_rendered_coords.len() > config::MAX_RENDERED_CHUNK_MESHES {
             meshes_to_remove
@@ -1136,24 +1433,36 @@ impl AdventureQuestApp {
             return;
         }
 
-        let Some(world) = self.world.as_mut() else {
-            return;
-        };
-
         let available_queue_slots = config::MAX_DIRTY_MESH_QUEUE_BACKLOG
             .saturating_sub(self.dirty_mesh_queue.pending_count());
         if available_queue_slots == 0 {
             return;
         }
 
-        let mut chunks_to_mesh: Vec<ChunkCoord> = world
-            .chunks
-            .keys()
-            .copied()
-            .filter(|coord| chunk_within_render_distance(center, *coord, settings))
-            .filter(|coord| !rendered_lookup.contains(coord))
-            .collect();
-        chunks_to_mesh.sort_by_key(|coord| chunk_distance_key(center, *coord));
+        let mut chunks_to_mesh: Vec<ChunkCoord> = {
+            let Some(world) = self.world.as_ref() else {
+                return;
+            };
+            let Some(renderer) = self.renderer.as_ref() else {
+                return;
+            };
+            let visibility = renderer.chunk_visibility(self.camera);
+
+            let mut chunks: Vec<ChunkCoord> = world
+                .chunks
+                .keys()
+                .copied()
+                .filter(|coord| !rendered_lookup.contains(coord))
+                .filter(|coord| {
+                    chunk_is_visible_render_candidate(world, visibility, center, *coord, settings)
+                })
+                .collect();
+
+            chunks.sort_by_cached_key(|coord| {
+                chunk_render_priority_key(world, self.camera, visibility, center, *coord, settings)
+            });
+            chunks
+        };
         chunks_to_mesh.truncate(
             config::MAX_NEW_RENDER_MESHES_QUEUED_PER_FRAME
                 .min(available_queue_slots)
@@ -1161,6 +1470,9 @@ impl AdventureQuestApp {
         );
 
         let mut queued_coords = Vec::new();
+        let Some(world) = self.world.as_mut() else {
+            return;
+        };
 
         for coord in chunks_to_mesh {
             if mark_all_subchunks_dirty(world, coord) {
@@ -1197,6 +1509,18 @@ fn load_saved_world_chunks(save_dir: &std::path::Path) -> HashMap<ChunkCoord, Ch
     }
 }
 
+fn camera_with_settings(mut camera: VoxelCamera, settings: GameSettings) -> VoxelCamera {
+    camera.fov_y_radians = settings.fov_degrees.to_radians();
+    camera.far = camera_far_plane(settings);
+    camera
+}
+
+fn camera_far_plane(settings: GameSettings) -> f32 {
+    let radius = settings.chunk_view_distance.max(1) as f32;
+
+    (radius + 2.0) * CHUNK_SIZE as f32
+}
+
 fn camera_chunk_coord(camera: VoxelCamera) -> ChunkCoord {
     let pos = camera_block_position(camera.position);
     world_to_chunk_coord(pos.x, pos.y, pos.z)
@@ -1213,26 +1537,176 @@ fn camera_block_position(position: [f32; 3]) -> BlockPos {
 fn streaming_chunk_coords(
     center: ChunkCoord,
     settings: WorldStreamingSettings,
+    camera: VoxelCamera,
+    viewport: PhysicalSize<u32>,
 ) -> VecDeque<ChunkCoord> {
-    let horizontal_radius = settings.horizontal_load_radius.max(0);
-    let vertical_radius = settings.vertical_load_radius.max(0);
-    let mut coords = Vec::new();
+    let radius = settings.render_radius.max(0);
+    let mut coords = Vec::with_capacity(config::MAX_STREAMING_COORDS_PER_CENTER.min(4096));
+    let mut seen = HashSet::new();
 
-    for dy in -vertical_radius..=vertical_radius {
-        for dz in -horizontal_radius..=horizontal_radius {
-            for dx in -horizontal_radius..=horizontal_radius {
-                if dx * dx + dz * dz > horizontal_radius * horizontal_radius {
+    push_near_streaming_coords(center, radius, &mut seen, &mut coords);
+    push_visible_ray_streaming_coords(center, settings, camera, viewport, &mut seen, &mut coords);
+
+    if coords.len() > config::MAX_STREAMING_COORDS_PER_CENTER {
+        coords.select_nth_unstable_by_key(config::MAX_STREAMING_COORDS_PER_CENTER, |coord| {
+            chunk_distance_key(center, *coord)
+        });
+        coords.truncate(config::MAX_STREAMING_COORDS_PER_CENTER);
+    }
+
+    coords.sort_by_cached_key(|coord| chunk_streaming_priority_key(camera, center, *coord));
+    coords.into()
+}
+
+fn streaming_view_key(
+    center: ChunkCoord,
+    settings: WorldStreamingSettings,
+    camera: VoxelCamera,
+) -> StreamingViewKey {
+    let bucket_size = config::STREAMING_VIEW_REBUILD_DEGREES.max(0.1).to_radians();
+
+    StreamingViewKey {
+        center,
+        radius: settings.render_radius.max(0),
+        yaw_bucket: (camera.yaw_radians / bucket_size).round() as i32,
+        pitch_bucket: (camera.pitch_radians / bucket_size).round() as i32,
+    }
+}
+
+fn push_near_streaming_coords(
+    center: ChunkCoord,
+    render_radius: i32,
+    seen: &mut HashSet<ChunkCoord>,
+    coords: &mut Vec<ChunkCoord>,
+) {
+    let radius = render_radius
+        .min(config::STREAMING_NEAR_CHUNK_RADIUS)
+        .max(0);
+
+    for dy in -radius..=radius {
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy + dz * dz > radius * radius {
                     continue;
                 }
 
-                coords.push(center.offset(dx, dy, dz));
+                push_streaming_coord(center.offset(dx, dy, dz), seen, coords);
             }
         }
     }
+}
 
-    coords.sort_by_key(|coord| chunk_distance_key(center, *coord));
-    coords.truncate(config::MAX_STREAMING_COORDS_PER_CENTER);
-    coords.into()
+fn push_visible_ray_streaming_coords(
+    center: ChunkCoord,
+    settings: WorldStreamingSettings,
+    camera: VoxelCamera,
+    viewport: PhysicalSize<u32>,
+    seen: &mut HashSet<ChunkCoord>,
+    coords: &mut Vec<ChunkCoord>,
+) {
+    let radius = settings.render_radius.max(0);
+    let width = config::STREAMING_RAY_GRID_COLUMNS.max(1);
+    let height = config::STREAMING_RAY_GRID_ROWS.max(1);
+    let min_visible_y = visible_ray_min_chunk_y(center);
+    let aspect = viewport.width.max(1) as f32 / viewport.height.max(1) as f32;
+    let half_vertical_tan = (camera.fov_y_radians * 0.5).tan();
+    let half_horizontal_tan = half_vertical_tan * aspect;
+    let forward = normalize3(camera.forward_direction());
+    let world_up = if dot3(forward, [0.0, 1.0, 0.0]).abs() > 0.98 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let right = normalize3(cross3(forward, world_up));
+    let up = normalize3(cross3(right, forward));
+
+    for row in 0..height {
+        let v = sample_axis(row, height);
+
+        for column in 0..width {
+            let u = sample_axis(column, width);
+            let direction = normalize3(add3(
+                add3(forward, mul3(right, u * half_horizontal_tan)),
+                mul3(up, v * half_vertical_tan),
+            ));
+
+            for distance in 1..=radius {
+                let world_pos = add3(
+                    camera.position,
+                    mul3(direction, distance as f32 * CHUNK_SIZE as f32),
+                );
+                let coord = world_to_chunk_coord(
+                    world_pos[0].floor() as i32,
+                    world_pos[1].floor() as i32,
+                    world_pos[2].floor() as i32,
+                );
+
+                if coord.y < min_visible_y {
+                    break;
+                }
+
+                if chunk_within_render_distance(center, coord, settings) {
+                    push_streaming_coord(coord, seen, coords);
+                }
+            }
+        }
+    }
+}
+
+fn visible_ray_min_chunk_y(center: ChunkCoord) -> i32 {
+    if center.y >= 0 {
+        -config::STREAMING_VISIBLE_RAY_MIN_CHUNKS_BELOW_SURFACE
+    } else {
+        center.y - config::STREAMING_NEAR_CHUNK_RADIUS
+    }
+}
+
+fn sample_axis(index: usize, count: usize) -> f32 {
+    if count <= 1 {
+        return 0.0;
+    }
+
+    index as f32 / (count - 1) as f32 * 2.0 - 1.0
+}
+
+fn push_streaming_coord(
+    coord: ChunkCoord,
+    seen: &mut HashSet<ChunkCoord>,
+    coords: &mut Vec<ChunkCoord>,
+) {
+    if seen.insert(coord) {
+        coords.push(coord);
+    }
+}
+
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn mul3(vector: [f32; 3], scalar: f32) -> [f32; 3] {
+    [vector[0] * scalar, vector[1] * scalar, vector[2] * scalar]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize3(vector: [f32; 3]) -> [f32; 3] {
+    let length = dot3(vector, vector).sqrt();
+
+    if length <= f32::EPSILON {
+        return [0.0, 0.0, 0.0];
+    }
+
+    [vector[0] / length, vector[1] / length, vector[2] / length]
 }
 
 fn chunk_distance_key(center: ChunkCoord, coord: ChunkCoord) -> i32 {
@@ -1248,13 +1722,192 @@ fn chunk_within_render_distance(
     coord: ChunkCoord,
     settings: WorldStreamingSettings,
 ) -> bool {
-    let horizontal_radius = settings.render_radius.max(0);
-    let vertical_radius = settings.vertical_load_radius.max(0);
-    let dx = (coord.x - center.x).abs();
-    let dy = (coord.y - center.y).abs();
-    let dz = (coord.z - center.z).abs();
+    let radius = settings.render_radius.max(0);
 
-    dy <= vertical_radius && dx * dx + dz * dz <= horizontal_radius * horizontal_radius
+    chunk_distance_key(center, coord) <= radius * radius
+}
+
+fn chunk_is_render_candidate(
+    world: &VoxelWorld,
+    center: ChunkCoord,
+    coord: ChunkCoord,
+    settings: WorldStreamingSettings,
+) -> bool {
+    chunk_within_render_distance(center, coord, settings) && chunk_is_render_skin(world, coord)
+}
+
+fn chunk_is_visible_render_candidate(
+    world: &VoxelWorld,
+    visibility: ChunkVisibility,
+    center: ChunkCoord,
+    coord: ChunkCoord,
+    settings: WorldStreamingSettings,
+) -> bool {
+    chunk_is_render_candidate(world, center, coord, settings) && visibility.contains(coord)
+}
+
+fn chunk_render_priority_key(
+    world: &VoxelWorld,
+    camera: VoxelCamera,
+    visibility: ChunkVisibility,
+    center: ChunkCoord,
+    coord: ChunkCoord,
+    settings: WorldStreamingSettings,
+) -> (u8, i32, i32, i32, i32, i32) {
+    let visibility_rank =
+        if chunk_is_visible_render_candidate(world, visibility, center, coord, settings) {
+            0
+        } else if chunk_is_render_candidate(world, center, coord, settings) {
+            1
+        } else {
+            2
+        };
+
+    (
+        visibility_rank,
+        chunk_camera_depth_key(camera, coord),
+        chunk_distance_key(center, coord),
+        coord.y,
+        coord.z,
+        coord.x,
+    )
+}
+
+fn chunk_streaming_priority_key(
+    camera: VoxelCamera,
+    center: ChunkCoord,
+    coord: ChunkCoord,
+) -> (u8, i32, i32, i32, i32, i32) {
+    (
+        (camera.chunk_depth(coord) < -(CHUNK_SIZE as f32)) as u8,
+        chunk_camera_depth_key(camera, coord),
+        chunk_distance_key(center, coord),
+        coord.y,
+        coord.z,
+        coord.x,
+    )
+}
+
+fn chunk_camera_depth_key(camera: VoxelCamera, coord: ChunkCoord) -> i32 {
+    let depth = camera.chunk_depth(coord);
+
+    if !depth.is_finite() {
+        return i32::MAX;
+    }
+
+    (depth.max(0.0) * 16.0).round() as i32
+}
+
+fn streaming_coord_occluded_by_loaded_world(
+    world: &VoxelWorld,
+    camera: VoxelCamera,
+    target: ChunkCoord,
+) -> bool {
+    let center = camera_chunk_coord(camera);
+    let near_radius_sq = config::STREAMING_NEAR_CHUNK_RADIUS * config::STREAMING_NEAR_CHUNK_RADIUS;
+
+    if chunk_distance_key(center, target) <= near_radius_sq {
+        return false;
+    }
+
+    let target_center = chunk_world_center(target);
+    let to_target = [
+        target_center[0] - camera.position[0],
+        target_center[1] - camera.position[1],
+        target_center[2] - camera.position[2],
+    ];
+    let distance = dot3(to_target, to_target).sqrt();
+
+    if distance <= CHUNK_SIZE as f32 * 2.0 {
+        return false;
+    }
+
+    let direction = normalize3(to_target);
+    let steps = (distance / (CHUNK_SIZE as f32 * 0.5)).ceil().max(1.0) as i32;
+    let mut last_coord = None;
+
+    for step in 1..steps {
+        let sample_distance = step as f32 / steps as f32 * distance;
+        let position = add3(camera.position, mul3(direction, sample_distance));
+        let coord = world_to_chunk_coord(
+            position[0].floor() as i32,
+            position[1].floor() as i32,
+            position[2].floor() as i32,
+        );
+
+        if coord == center || coord == target || last_coord == Some(coord) {
+            continue;
+        }
+
+        last_coord = Some(coord);
+
+        if world.get_chunk(coord).is_some_and(|chunk| {
+            !chunk.is_empty() && chunk_has_sky_exposed_surface(world, coord, chunk)
+        }) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn chunk_world_center(coord: ChunkCoord) -> [f32; 3] {
+    let size = CHUNK_SIZE as f32;
+
+    [
+        coord.x as f32 * size + size * 0.5,
+        coord.y as f32 * size + size * 0.5,
+        coord.z as f32 * size + size * 0.5,
+    ]
+}
+
+fn chunk_is_render_skin(world: &VoxelWorld, coord: ChunkCoord) -> bool {
+    let Some(chunk) = world.get_chunk(coord) else {
+        return false;
+    };
+
+    if chunk.is_empty() {
+        return false;
+    }
+
+    chunk_has_sky_exposed_surface(world, coord, chunk)
+}
+
+fn chunk_has_sky_exposed_surface(world: &VoxelWorld, coord: ChunkCoord, chunk: &Chunk) -> bool {
+    for z in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            for y in (0..CHUNK_SIZE).rev() {
+                if chunk.get_block(x, y, z) == AIR_BLOCK {
+                    continue;
+                }
+
+                if block_has_loaded_air_above(world, coord, chunk, x, y, z) {
+                    return true;
+                }
+
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+fn block_has_loaded_air_above(
+    world: &VoxelWorld,
+    coord: ChunkCoord,
+    chunk: &Chunk,
+    x: usize,
+    y: usize,
+    z: usize,
+) -> bool {
+    if y + 1 < CHUNK_SIZE {
+        return chunk.get_block(x, y + 1, z) == AIR_BLOCK;
+    }
+
+    world
+        .get_chunk(coord.offset(0, 1, 0))
+        .is_some_and(|above| above.get_block(x, 0, z) == AIR_BLOCK)
 }
 
 fn interaction_priority_chunks(interaction: BlockInteraction) -> Vec<ChunkCoord> {
@@ -1315,8 +1968,7 @@ fn push_unique_chunk_coord(coords: &mut Vec<ChunkCoord>, coord: ChunkCoord) {
 fn mark_streamed_chunk_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> Vec<ChunkCoord> {
     let mut dirty_coords = Vec::new();
 
-    for dirty_coord in [coord].into_iter().chain(neighbor_chunk_coords(coord))
-    {
+    for dirty_coord in [coord].into_iter().chain(neighbor_chunk_coords(coord)) {
         if mark_all_subchunks_dirty(world, dirty_coord) {
             dirty_coords.push(dirty_coord);
         }
@@ -1351,11 +2003,6 @@ fn mark_all_subchunks_dirty(world: &mut VoxelWorld, coord: ChunkCoord) -> bool {
 const PLAYER_REACH: f32 = 8.0;
 const PLAYER_HALF_EXTENTS: [f32; 3] = [0.3, 0.9, 0.3];
 const PLAYER_EYE_HEIGHT: f32 = 1.62;
-const PLAYER_WALK_SPEED: f32 = 5.5;
-const PLAYER_SPRINT_SPEED: f32 = 8.5;
-const PLAYER_JUMP_SPEED: f32 = 8.0;
-const PLAYER_GRAVITY: f32 = 24.0;
-const PLAYER_MAX_FALL_SPEED: f32 = 48.0;
 
 #[derive(Debug, Clone)]
 struct MenuLayout {
@@ -1525,6 +2172,7 @@ fn build_menu_layout(
             let field_x = (width * 0.5 + 90.0).min(width - 300.0).max(label_x + 310.0);
             let first_y = height * 0.30;
             let second_y = height * 0.42;
+            let third_y = height * 0.54;
 
             push_text(
                 &mut overlay,
@@ -1560,18 +2208,181 @@ fn build_menu_layout(
                 active_field == Some(SettingsField::ChunkViewDistance),
             );
 
+            push_text(
+                &mut overlay,
+                label_x,
+                third_y + 11.0,
+                2.4,
+                "FOV",
+                [0.86, 0.91, 0.93, 1.0],
+            );
+            push_textbox(
+                &mut overlay,
+                &mut hits,
+                MenuAction::Fov,
+                ScreenRect::new(field_x, third_y, 260.0, 52.0),
+                &settings_inputs.fov_degrees,
+                active_field == Some(SettingsField::Fov),
+            );
+
             push_button(
                 &mut overlay,
                 &mut hits,
                 MenuAction::Back,
-                ScreenRect::centered(width, height * 0.62, 240.0, 52.0),
+                ScreenRect::centered(width, height * 0.72, 240.0, 52.0),
                 "BACK",
             );
         }
-        AppScreen::InGame => {}
+        AppScreen::LoadingWorld | AppScreen::InGame => {}
     }
 
     MenuLayout { overlay, hits }
+}
+
+fn build_loading_overlay(progress: f32, size: PhysicalSize<u32>) -> UiOverlay {
+    const BAR_WIDTH: f32 = 340.0;
+    const BAR_HEIGHT: f32 = 10.0;
+    const BAR_INSET: f32 = 2.0;
+
+    let width = size.width.max(1) as f32;
+    let height = size.height.max(1) as f32;
+    let progress = progress.clamp(0.0, 1.0);
+    let mut overlay = UiOverlay::default();
+    let background = ScreenRect::new(0.0, 0.0, width, height);
+    let bar = ScreenRect::centered(width, height * 0.55, BAR_WIDTH, BAR_HEIGHT);
+    let fill_width = (BAR_WIDTH - BAR_INSET * 2.0) * progress;
+
+    push_ui_rect(&mut overlay, background, [0.0, 0.0, 0.0, 1.0]);
+    push_ui_rect(&mut overlay, bar, [0.0, 0.0, 0.0, 1.0]);
+    push_ui_border(&mut overlay, bar, 1.0, [1.0, 1.0, 1.0, 0.85]);
+
+    if fill_width > 0.0 {
+        push_ui_rect(
+            &mut overlay,
+            ScreenRect::new(
+                bar.x + BAR_INSET,
+                bar.y + BAR_INSET,
+                fill_width,
+                BAR_HEIGHT - BAR_INSET * 2.0,
+            ),
+            [1.0, 1.0, 1.0, 0.95],
+        );
+    }
+
+    overlay
+}
+
+fn build_gameplay_overlay(
+    hotbar: &Hotbar,
+    break_progress: Option<f32>,
+    size: PhysicalSize<u32>,
+) -> UiOverlay {
+    let width = size.width.max(1) as f32;
+    let height = size.height.max(1) as f32;
+    let mut overlay = UiOverlay::default();
+
+    if let Some(progress) = break_progress {
+        push_break_progress_bar(&mut overlay, width, height, progress);
+    }
+
+    let slot_size = 48.0;
+    let slot_gap = 6.0;
+    let slot_count = HOTBAR_SLOT_COUNT as f32;
+    let bar_width = slot_size * slot_count + slot_gap * (slot_count - 1.0);
+    let x_start = ((width - bar_width) * 0.5).max(8.0);
+    let y = (height - slot_size - 26.0).max(8.0);
+    let selected_block = hotbar.selected_block();
+    let selected_label = block_ui_label(selected_block);
+
+    push_centered_text(
+        &mut overlay,
+        selected_label,
+        2.0,
+        width,
+        (y - 28.0).max(8.0),
+        [1.0, 1.0, 1.0, 1.0],
+    );
+
+    for (slot, block) in hotbar.slots().iter().copied().enumerate() {
+        let x = x_start + slot as f32 * (slot_size + slot_gap);
+        let rect = ScreenRect::new(x, y, slot_size, slot_size);
+        let is_selected = slot == hotbar.selected_slot();
+
+        push_ui_rect(&mut overlay, rect, [0.035, 0.042, 0.047, 0.92]);
+        push_ui_border(
+            &mut overlay,
+            rect,
+            if is_selected { 3.0 } else { 2.0 },
+            if is_selected {
+                [1.0, 0.78, 0.28, 1.0]
+            } else {
+                [0.36, 0.43, 0.46, 1.0]
+            },
+        );
+
+        let swatch = ScreenRect::new(rect.x + 11.0, rect.y + 12.0, 26.0, 26.0);
+        if block == AIR_BLOCK {
+            push_ui_rect(&mut overlay, swatch, [0.075, 0.085, 0.09, 0.86]);
+            push_centered_text_in_rect(&mut overlay, swatch, "-", 2.2, [0.62, 0.68, 0.70, 1.0]);
+        } else if let Some(uvs) = block_hotbar_uvs(block) {
+            push_ui_texture_rect(&mut overlay, swatch, block_ui_color(block), uvs);
+            push_ui_border(&mut overlay, swatch, 1.0, [0.0, 0.0, 0.0, 0.42]);
+        } else {
+            push_ui_rect(&mut overlay, swatch, block_ui_color(block));
+            push_ui_border(&mut overlay, swatch, 1.0, [0.0, 0.0, 0.0, 0.42]);
+        }
+
+        push_text(
+            &mut overlay,
+            rect.x + 5.0,
+            rect.y + 4.0,
+            1.3,
+            &(slot + 1).to_string(),
+            [0.86, 0.90, 0.92, 1.0],
+        );
+    }
+
+    overlay
+}
+
+fn push_break_progress_bar(overlay: &mut UiOverlay, width: f32, height: f32, progress: f32) {
+    const BAR_WIDTH: f32 = 116.0;
+    const BAR_HEIGHT: f32 = 8.0;
+    const BAR_Y_OFFSET: f32 = 26.0;
+    const BAR_INSET: f32 = 2.0;
+
+    let progress = progress.clamp(0.0, 1.0);
+    let background = ScreenRect::new(
+        (width - BAR_WIDTH) * 0.5,
+        height * 0.5 + BAR_Y_OFFSET,
+        BAR_WIDTH,
+        BAR_HEIGHT,
+    );
+    let fill_width = (BAR_WIDTH - BAR_INSET * 2.0) * progress;
+
+    push_ui_rect(overlay, background, [0.0, 0.0, 0.0, 0.62]);
+    push_ui_border(overlay, background, 1.0, [1.0, 1.0, 1.0, 0.78]);
+
+    if fill_width > 0.0 {
+        push_ui_rect(
+            overlay,
+            ScreenRect::new(
+                background.x + BAR_INSET,
+                background.y + BAR_INSET,
+                fill_width,
+                BAR_HEIGHT - BAR_INSET * 2.0,
+            ),
+            [1.0, 1.0, 1.0, 0.95],
+        );
+    }
+}
+
+fn block_ui_label(block: BlockId) -> &'static str {
+    block_label(block)
+}
+
+fn block_ui_color(block: BlockId) -> [f32; 4] {
+    block_color_rgba(block)
 }
 
 fn push_button(
@@ -1644,6 +2455,24 @@ fn push_ui_rect(overlay: &mut UiOverlay, rect: ScreenRect, color: [f32; 4]) {
         rect.height,
         color,
     )));
+}
+
+fn push_ui_texture_rect(
+    overlay: &mut UiOverlay,
+    rect: ScreenRect,
+    color: [f32; 4],
+    uvs: [[f32; 2]; 4],
+) {
+    overlay
+        .items
+        .push(UiOverlayItem::Texture(UiTextureRect::new(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            color,
+            uvs,
+        )));
 }
 
 fn push_ui_border(overlay: &mut UiOverlay, rect: ScreenRect, thickness: f32, color: [f32; 4]) {
@@ -1721,22 +2550,97 @@ fn text_pixel_width(text: &str, scale: f32) -> f32 {
 
 fn is_settings_character_allowed(field: SettingsField, character: char) -> bool {
     match field {
-        SettingsField::MouseSensitivity => character.is_ascii_digit() || character == '.',
+        SettingsField::MouseSensitivity | SettingsField::Fov => {
+            character.is_ascii_digit() || character == '.'
+        }
         SettingsField::ChunkViewDistance => character.is_ascii_digit(),
     }
 }
 
-fn settings_input_limit(field: SettingsField) -> usize {
-    match field {
-        SettingsField::MouseSensitivity => 8,
-        SettingsField::ChunkViewDistance => 2,
+fn parse_clamped_i32_setting(input: &str, fallback: i32, min: i32, max: i32) -> i32 {
+    let input = input.trim();
+
+    if input.is_empty() {
+        return fallback;
+    }
+
+    input
+        .parse::<i64>()
+        .map(|value| value.clamp(min as i64, max as i64) as i32)
+        .unwrap_or(max)
+}
+
+fn parse_clamped_f32_setting(input: &str, fallback: f32, min: f32, max: f32) -> f32 {
+    let input = input.trim();
+
+    if input.is_empty() {
+        return fallback;
+    }
+
+    input
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.clamp(min as f64, max as f64) as f32)
+        .unwrap_or(max)
+}
+
+fn quantize_break_progress(progress: f32) -> u8 {
+    (progress.clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BlockBreakState {
+    target: Option<BlockBreakTarget>,
+}
+
+impl BlockBreakState {
+    fn reset(&mut self) {
+        self.target = None;
+    }
+
+    fn apply_damage(&mut self, hit: physics::VoxelRayHit, block_hp: f32, damage: f32) -> bool {
+        if block_hp <= 0.0 {
+            return true;
+        }
+
+        if damage <= 0.0 {
+            return false;
+        }
+
+        let target = self.target.get_or_insert(BlockBreakTarget {
+            block: hit.world_block,
+            block_id: hit.block_id,
+            accumulated_damage: 0.0,
+        });
+
+        if target.block != hit.world_block || target.block_id != hit.block_id {
+            *target = BlockBreakTarget {
+                block: hit.world_block,
+                block_id: hit.block_id,
+                accumulated_damage: 0.0,
+            };
+        }
+
+        target.accumulated_damage += damage;
+        target.accumulated_damage >= block_hp
+    }
+
+    fn progress_ratio(self, block_hp: f32) -> Option<f32> {
+        if block_hp <= 0.0 {
+            return None;
+        }
+
+        self.target
+            .map(|target| (target.accumulated_damage / block_hp).clamp(0.0, 1.0))
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum BlockAction {
-    Break,
-    Place,
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockBreakTarget {
+    block: BlockPos,
+    block_id: BlockId,
+    accumulated_damage: f32,
 }
 
 #[derive(Debug, Default)]
@@ -1786,29 +2690,44 @@ impl PlayerController {
     }
 
     fn step(&mut self, world: &VoxelWorld, yaw_radians: f32, input: InputState, dt: f32) {
-        let (mut horizontal_x, mut horizontal_z) = horizontal_movement(yaw_radians, input);
-        let horizontal_length = (horizontal_x * horizontal_x + horizontal_z * horizontal_z).sqrt();
+        self.on_ground = self.velocity[1] <= 0.0
+            && aabb_has_ground_support(
+                world,
+                self.center,
+                PLAYER_HALF_EXTENTS,
+                config::PLAYER_GROUND_SUPPORT_DISTANCE,
+            );
 
-        if horizontal_length > 1.0 {
-            horizontal_x /= horizontal_length;
-            horizontal_z /= horizontal_length;
-        }
-
-        let movement_speed = if input.fast {
-            PLAYER_SPRINT_SPEED
+        let current_velocity = (self.velocity[0], self.velocity[2]);
+        let target_velocity = horizontal_target_velocity(yaw_radians, input, self.on_ground);
+        let (velocity_x, velocity_z) = if self.on_ground {
+            integrate_horizontal_velocity(
+                current_velocity,
+                target_velocity,
+                config::PLAYER_MOVE_ACCELERATION,
+                dt,
+            )
         } else {
-            PLAYER_WALK_SPEED
+            integrate_air_horizontal_velocity(
+                current_velocity,
+                target_velocity,
+                config::PLAYER_MOVE_ACCELERATION,
+                dt,
+            )
         };
 
-        self.velocity[0] = horizontal_x * movement_speed;
-        self.velocity[2] = horizontal_z * movement_speed;
+        self.velocity[0] = velocity_x;
+        self.velocity[2] = velocity_z;
 
         if input.up && self.on_ground {
-            self.velocity[1] = PLAYER_JUMP_SPEED;
+            self.velocity[1] = jump_velocity_from_height(config::PLAYER_JUMP_HEIGHT);
             self.on_ground = false;
+        } else if self.on_ground {
+            self.velocity[1] = 0.0;
+        } else {
+            self.velocity[1] = (self.velocity[1] - config::PLAYER_GRAVITY * dt)
+                .max(-config::PLAYER_MAX_FALL_SPEED);
         }
-
-        self.velocity[1] = (self.velocity[1] - PLAYER_GRAVITY * dt).max(-PLAYER_MAX_FALL_SPEED);
 
         let delta = [
             self.velocity[0] * dt,
@@ -1844,21 +2763,107 @@ fn player_center_to_camera_position(center: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn horizontal_movement(yaw_radians: f32, input: InputState) -> (f32, f32) {
+fn horizontal_target_velocity(yaw_radians: f32, input: InputState, on_ground: bool) -> (f32, f32) {
     let forward_axis = input.forward_axis();
     let right_axis = input.right_axis();
     let forward = (yaw_radians.cos(), yaw_radians.sin());
     let right = (-yaw_radians.sin(), yaw_radians.cos());
+    let (forward_speed, side_speed) = horizontal_axis_speeds(input, on_ground);
 
     (
-        forward.0 * forward_axis + right.0 * right_axis,
-        forward.1 * forward_axis + right.1 * right_axis,
+        forward.0 * forward_axis * forward_speed + right.0 * right_axis * side_speed,
+        forward.1 * forward_axis * forward_speed + right.1 * right_axis * side_speed,
     )
+}
+
+fn horizontal_axis_speeds(input: InputState, on_ground: bool) -> (f32, f32) {
+    if !on_ground {
+        return (
+            config::PLAYER_IN_AIR_MOVE_SPEED,
+            config::PLAYER_IN_AIR_MOVE_SPEED,
+        );
+    }
+
+    if input.slow {
+        return (config::PLAYER_CROUCH_SPEED, config::PLAYER_CROUCH_SPEED);
+    }
+
+    let forward_speed = if input.can_sprint_forward() {
+        config::PLAYER_SPRINT_SPEED
+    } else {
+        config::PLAYER_WALK_SPEED
+    };
+
+    (forward_speed, config::PLAYER_WALK_SPEED)
+}
+
+fn integrate_horizontal_velocity(
+    current: (f32, f32),
+    target: (f32, f32),
+    move_acceleration: f32,
+    dt: f32,
+) -> (f32, f32) {
+    if move_acceleration <= 0.0 || dt <= 0.0 {
+        return current;
+    }
+
+    let acceleration = (
+        move_acceleration * (target.0 - current.0),
+        move_acceleration * (target.1 - current.1),
+    );
+    let velocity_delta = (acceleration.0 * dt, acceleration.1 * dt);
+
+    if move_acceleration * dt >= 1.0 {
+        target
+    } else {
+        (current.0 + velocity_delta.0, current.1 + velocity_delta.1)
+    }
+}
+
+fn integrate_air_horizontal_velocity(
+    current: (f32, f32),
+    target: (f32, f32),
+    move_acceleration: f32,
+    dt: f32,
+) -> (f32, f32) {
+    if horizontal_speed_squared(target) <= f32::EPSILON {
+        return current;
+    }
+
+    let current_speed = horizontal_speed(current);
+    let velocity = integrate_horizontal_velocity(current, target, move_acceleration, dt);
+    let velocity_speed = horizontal_speed(velocity);
+
+    if velocity_speed >= current_speed || current_speed <= f32::EPSILON {
+        return velocity;
+    }
+
+    if velocity_speed <= f32::EPSILON {
+        return current;
+    }
+
+    let scale = current_speed / velocity_speed;
+
+    (velocity.0 * scale, velocity.1 * scale)
+}
+
+fn horizontal_speed(velocity: (f32, f32)) -> f32 {
+    horizontal_speed_squared(velocity).sqrt()
+}
+
+fn horizontal_speed_squared(velocity: (f32, f32)) -> f32 {
+    velocity.0 * velocity.0 + velocity.1 * velocity.1
+}
+
+fn jump_velocity_from_height(height: f32) -> f32 {
+    (2.0 * config::PLAYER_GRAVITY * height.max(0.0)).sqrt()
 }
 
 #[derive(Debug, Default)]
 struct DirtyMeshQueue {
     pending: VecDeque<ChunkCoord>,
+    pending_set: HashSet<ChunkCoord>,
+    needs_priority_sort: bool,
 }
 
 impl DirtyMeshQueue {
@@ -1869,22 +2874,33 @@ impl DirtyMeshQueue {
         }
     }
 
-    fn enqueue_dirty_within(
+    fn prioritize(
         &mut self,
         world: &VoxelWorld,
+        camera: VoxelCamera,
+        visibility: ChunkVisibility,
         center: ChunkCoord,
         settings: WorldStreamingSettings,
     ) {
-        for coord in dirty_window_chunk_coords(world) {
-            if chunk_within_render_distance(center, coord, settings) {
-                self.enqueue(coord);
-            }
+        if !self.needs_priority_sort || self.pending.len() < 2 {
+            self.needs_priority_sort = false;
+            return;
         }
+
+        self.pending.make_contiguous().sort_by_cached_key(|coord| {
+            chunk_render_priority_key(world, camera, visibility, center, *coord, settings)
+        });
+        self.needs_priority_sort = false;
+    }
+
+    fn request_prioritize(&mut self) {
+        self.needs_priority_sort = true;
     }
 
     fn enqueue(&mut self, coord: ChunkCoord) {
-        if !self.pending.contains(&coord) {
+        if self.pending_set.insert(coord) {
             self.pending.push_back(coord);
+            self.needs_priority_sort = true;
         }
     }
 
@@ -1900,12 +2916,19 @@ impl DirtyMeshQueue {
     }
 
     fn enqueue_front(&mut self, coord: ChunkCoord) {
-        self.pending.retain(|pending| *pending != coord);
+        if self.pending_set.remove(&coord) {
+            self.pending.retain(|pending| *pending != coord);
+        }
+
+        self.pending_set.insert(coord);
         self.pending.push_front(coord);
+        self.needs_priority_sort = true;
     }
 
     fn pop_dirty(&mut self, world: &VoxelWorld) -> Option<ChunkCoord> {
         while let Some(coord) = self.pending.pop_front() {
+            self.pending_set.remove(&coord);
+
             let is_dirty = world
                 .get_chunk(coord)
                 .map(|chunk| chunk.subchunk_dirty_mask != 0)
@@ -2003,14 +3026,22 @@ impl ChunkJobQueue {
         self.pending_meshes.len()
     }
 
+    fn mesh_pending_count(&self) -> usize {
+        self.pending_meshes.len() + self.pending_priority_meshes.len()
+    }
+
     fn generation_pending_count(&self) -> usize {
         self.pending_generation.len()
     }
 
-    fn drain_results(&mut self) -> Vec<ChunkJobResult> {
+    fn drain_results(&mut self, max_results: usize) -> Vec<ChunkJobResult> {
         let mut results = Vec::new();
 
-        while let Ok(result) = self.receiver.try_recv() {
+        for _ in 0..max_results {
+            let Ok(result) = self.receiver.try_recv() else {
+                break;
+            };
+
             match &result {
                 ChunkJobResult::Generated { coord, .. } => {
                     self.pending_generation.remove(coord);
@@ -2116,15 +3147,23 @@ fn run_chunk_worker(receiver: Receiver<ChunkJob>, sender: Sender<ChunkJobResult>
 #[derive(Debug)]
 struct ChunkStreamingState {
     settings: WorldStreamingSettings,
-    center_chunk: Option<ChunkCoord>,
+    view_key: Option<StreamingViewKey>,
     pending_loads: VecDeque<ChunkCoord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingViewKey {
+    center: ChunkCoord,
+    radius: i32,
+    yaw_bucket: i32,
+    pitch_bucket: i32,
 }
 
 impl ChunkStreamingState {
     fn new(settings: WorldStreamingSettings) -> Self {
         Self {
             settings,
-            center_chunk: None,
+            view_key: None,
             pending_loads: VecDeque::new(),
         }
     }
@@ -2135,27 +3174,53 @@ impl ChunkStreamingState {
         }
 
         self.settings = settings;
-
-        if let Some(center) = self.center_chunk {
-            self.pending_loads = streaming_chunk_coords(center, self.settings);
-        }
+        self.view_key = None;
+        self.pending_loads.clear();
     }
 
-    fn update_center(&mut self, center: ChunkCoord) -> bool {
-        if self.center_chunk == Some(center) {
+    fn update_view(
+        &mut self,
+        center: ChunkCoord,
+        camera: VoxelCamera,
+        viewport: PhysicalSize<u32>,
+    ) -> bool {
+        let key = streaming_view_key(center, self.settings, camera);
+
+        if self.view_key == Some(key) {
             return false;
         }
 
-        self.center_chunk = Some(center);
-        self.pending_loads = streaming_chunk_coords(center, self.settings);
+        self.view_key = Some(key);
+        self.pending_loads = streaming_chunk_coords(center, self.settings, camera, viewport);
         true
     }
 
+    #[cfg(test)]
     fn pop_missing(&mut self, world: &VoxelWorld) -> Option<ChunkCoord> {
         while let Some(coord) = self.pending_loads.pop_front() {
             if world.get_chunk(coord).is_none() {
                 return Some(coord);
             }
+        }
+
+        None
+    }
+
+    fn pop_missing_visible(
+        &mut self,
+        world: &VoxelWorld,
+        camera: VoxelCamera,
+    ) -> Option<ChunkCoord> {
+        while let Some(coord) = self.pending_loads.pop_front() {
+            if world.get_chunk(coord).is_some() {
+                continue;
+            }
+
+            if streaming_coord_occluded_by_loaded_world(world, camera, coord) {
+                continue;
+            }
+
+            return Some(coord);
         }
 
         None
@@ -2181,7 +3246,9 @@ struct InputState {
     right: bool,
     up: bool,
     down: bool,
+    slow: bool,
     fast: bool,
+    breaking: bool,
 }
 
 impl InputState {
@@ -2192,8 +3259,9 @@ impl InputState {
             KeyCode::KeyA => self.left = pressed,
             KeyCode::KeyD => self.right = pressed,
             KeyCode::Space => self.up = pressed,
-            KeyCode::ControlLeft | KeyCode::ControlRight => self.down = pressed,
+            KeyCode::AltLeft | KeyCode::AltRight => self.down = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.fast = pressed,
+            KeyCode::ControlLeft | KeyCode::ControlRight => self.slow = pressed,
             _ => {}
         }
     }
@@ -2208,6 +3276,10 @@ impl InputState {
 
     fn up_axis(self) -> f32 {
         axis(self.up, self.down)
+    }
+
+    fn can_sprint_forward(self) -> bool {
+        self.fast && self.forward && !self.backward && !self.slow
     }
 }
 
@@ -2236,106 +3308,199 @@ fn hotbar_slot_for_key(key: KeyCode) -> Option<usize> {
     (slot < HOTBAR_SLOT_COUNT).then_some(slot)
 }
 
-struct WindowWorldState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorldLoadPhase {
+    Generating,
+    Meshing,
+}
+
+struct WorldLoadState {
     world: VoxelWorld,
-    meshes: Vec<WindowChunkMesh>,
+    coords: Vec<ChunkCoord>,
+    next_generation: usize,
+    generated_chunks: usize,
+    mesh_queue: VecDeque<ChunkCoord>,
+    mesh_target_chunks: usize,
+    mesh_results: usize,
+    mesh_jobs_queued: usize,
+    phase: WorldLoadPhase,
 }
 
-struct WindowChunkMesh {
-    coord: ChunkCoord,
-    revision: u32,
-    visible_mask: u8,
-    mesh: MeshData,
-}
-
-impl WindowChunkMesh {
-    fn upload(&self) -> ChunkMeshUpload<'_> {
-        ChunkMeshUpload {
-            coord: self.coord,
-            revision: self.revision,
-            visible_mask: self.visible_mask,
-            mesh: &self.mesh,
+impl WorldLoadState {
+    fn new(
+        streaming_settings: WorldStreamingSettings,
+        camera: VoxelCamera,
+        viewport: PhysicalSize<u32>,
+    ) -> Self {
+        Self {
+            world: VoxelWorld::new(config::WORLD_SEED),
+            coords: initial_world_preload_coords(streaming_settings, camera, viewport),
+            next_generation: 0,
+            generated_chunks: 0,
+            mesh_queue: VecDeque::new(),
+            mesh_target_chunks: 0,
+            mesh_results: 0,
+            mesh_jobs_queued: 0,
+            phase: WorldLoadPhase::Generating,
         }
+    }
+
+    fn generate_chunks(&mut self, saved_chunks: &HashMap<ChunkCoord, Chunk>) {
+        if self.phase != WorldLoadPhase::Generating {
+            return;
+        }
+
+        for _ in 0..config::LOADING_CHUNKS_GENERATED_PER_FRAME {
+            let Some(coord) = self.coords.get(self.next_generation).copied() else {
+                break;
+            };
+
+            let chunk = saved_chunks
+                .get(&coord)
+                .cloned()
+                .unwrap_or_else(|| VoxelWorld::generate_chunk(self.world.seed(), coord));
+            self.world.insert_chunk(chunk);
+            self.next_generation += 1;
+            self.generated_chunks += 1;
+        }
+    }
+
+    fn is_generation_complete(&self) -> bool {
+        self.generated_chunks >= self.coords.len()
+    }
+
+    fn meshing_started(&self) -> bool {
+        self.phase == WorldLoadPhase::Meshing
+    }
+
+    fn start_meshing(
+        &mut self,
+        camera: VoxelCamera,
+        visibility: ChunkVisibility,
+        settings: WorldStreamingSettings,
+    ) {
+        if self.phase == WorldLoadPhase::Meshing {
+            return;
+        }
+
+        let center = camera_chunk_coord(camera);
+        let mut coords: Vec<ChunkCoord> = self
+            .coords
+            .iter()
+            .copied()
+            .filter(|coord| {
+                chunk_is_visible_render_candidate(&self.world, visibility, center, *coord, settings)
+            })
+            .collect();
+
+        if coords.is_empty() {
+            coords = self
+                .coords
+                .iter()
+                .copied()
+                .filter(|coord| chunk_is_render_candidate(&self.world, center, *coord, settings))
+                .collect();
+        }
+
+        coords.sort_by_cached_key(|coord| {
+            chunk_render_priority_key(&self.world, camera, visibility, center, *coord, settings)
+        });
+        coords.truncate(config::MAX_RENDERED_CHUNK_MESHES);
+
+        self.mesh_target_chunks = coords.len();
+        self.mesh_queue = coords.into();
+        self.phase = WorldLoadPhase::Meshing;
+    }
+
+    fn schedule_mesh_jobs(&mut self, chunk_jobs: &mut ChunkJobQueue) {
+        if self.phase != WorldLoadPhase::Meshing {
+            return;
+        }
+
+        let mut queued_this_frame = 0;
+
+        while queued_this_frame < config::LOADING_MESH_JOBS_QUEUED_PER_FRAME
+            && chunk_jobs.mesh_pending_count() < config::MAX_LOADING_MESH_JOBS_PENDING
+        {
+            let Some(coord) = self.mesh_queue.pop_front() else {
+                break;
+            };
+
+            if chunk_jobs.is_mesh_pending(coord) {
+                continue;
+            }
+
+            let Some(input) = ChunkMeshInput::from_world(&self.world, coord) else {
+                self.mesh_target_chunks = self.mesh_target_chunks.saturating_sub(1);
+                continue;
+            };
+
+            let queued = if self.mesh_jobs_queued % 2 == 0 {
+                chunk_jobs.enqueue_mesh(input)
+            } else {
+                chunk_jobs.enqueue_mesh_priority(input)
+            };
+
+            if queued {
+                self.mesh_jobs_queued += 1;
+                queued_this_frame += 1;
+            } else {
+                self.mesh_target_chunks = self.mesh_target_chunks.saturating_sub(1);
+            }
+        }
+    }
+
+    fn record_mesh_result(&mut self) {
+        self.mesh_results += 1;
+    }
+
+    fn is_complete(&self, chunk_jobs: &ChunkJobQueue) -> bool {
+        self.phase == WorldLoadPhase::Meshing
+            && self.mesh_queue.is_empty()
+            && self.mesh_results >= self.mesh_target_chunks
+            && chunk_jobs.mesh_pending_count() == 0
+    }
+
+    fn progress(&self) -> f32 {
+        let chunk_progress = progress_ratio(self.generated_chunks, self.coords.len());
+
+        if self.phase == WorldLoadPhase::Generating {
+            return chunk_progress * 0.75;
+        }
+
+        0.75 + progress_ratio(self.mesh_results, self.mesh_target_chunks) * 0.25
     }
 }
 
-fn build_window_world(
+fn initial_world_preload_coords(
     streaming_settings: WorldStreamingSettings,
-    saved_chunks: &HashMap<ChunkCoord, Chunk>,
-) -> WindowWorldState {
-    let mut world = VoxelWorld::new(config::WORLD_SEED);
-    let player_block = camera_block_position(VoxelCamera::looking_at_chunk_origin().position);
-    let initial_radius =
-        config::INITIAL_SYNC_CHUNK_RADIUS.min(streaming_settings.horizontal_load_radius);
-    let initial_vertical_radius =
-        config::INITIAL_SYNC_CHUNK_RADIUS.min(streaming_settings.vertical_load_radius);
-    let initial_settings = WorldStreamingSettings::new(
-        initial_radius,
-        initial_vertical_radius,
-        initial_radius,
-        initial_radius,
-        initial_radius,
-        initial_radius + 1,
-    );
+    camera: VoxelCamera,
+    viewport: PhysicalSize<u32>,
+) -> Vec<ChunkCoord> {
+    let center = camera_chunk_coord(camera);
+    let mut coords: Vec<ChunkCoord> =
+        streaming_chunk_coords(center, streaming_settings, camera, viewport)
+            .into_iter()
+            .collect();
 
-    world.load_chunks_around_block(player_block, initial_settings);
-    apply_saved_chunks_to_loaded_world(&mut world, saved_chunks);
+    coords.truncate(config::INITIAL_WORLD_PRELOAD_CHUNK_LIMIT);
 
-    let meshes = build_window_meshes(&mut world);
-
-    WindowWorldState { world, meshes }
-}
-
-fn apply_saved_chunks_to_loaded_world(
-    world: &mut VoxelWorld,
-    saved_chunks: &HashMap<ChunkCoord, Chunk>,
-) {
-    let loaded_coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
-
-    for coord in loaded_coords {
-        let Some(chunk) = saved_chunks.get(&coord) else {
-            continue;
-        };
-
-        world.chunks.insert(coord, chunk.clone());
-    }
-}
-
-fn build_window_meshes(world: &mut VoxelWorld) -> Vec<WindowChunkMesh> {
-    let mut coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
-    coords.sort_by_key(|coord| (coord.y, coord.z, coord.x));
-
-    let mut meshes = Vec::new();
-
-    for coord in coords {
-        let Some(mesh) = mesh_chunk(world, coord) else {
-            continue;
-        };
-
-        let revision = world
-            .get_chunk(coord)
-            .map(|chunk| chunk.revision)
-            .unwrap_or_default();
-        let visible_mask = mesh.subchunk_visible_mask;
-
-        if let Some(chunk) = world.get_chunk_mut(coord) {
-            chunk.subchunk_visible_mask = visible_mask;
-            chunk.clear_dirty();
-        }
-
-        if !mesh.indices.is_empty() {
-            meshes.push(WindowChunkMesh {
-                coord,
-                revision,
-                visible_mask,
-                mesh,
-            });
-        }
+    if !coords.contains(&center) {
+        coords.insert(0, center);
     }
 
-    meshes
+    coords
 }
 
+fn progress_ratio(done: usize, total: usize) -> f32 {
+    if total == 0 {
+        return 1.0;
+    }
+
+    done.min(total) as f32 / total as f32
+}
+
+#[cfg(test)]
 fn dirty_window_chunk_coords(world: &VoxelWorld) -> Vec<ChunkCoord> {
     let mut coords: Vec<ChunkCoord> = world
         .chunks
@@ -2503,7 +3668,9 @@ fn changed_block_count(interaction: BlockInteraction) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voxels::{Chunk, STONE_BLOCK};
+    use voxels::{
+        Chunk, CHUNK_VOLUME, COAL_ORE_BLOCK, DIRT_BLOCK, GRASS_BLOCK, IRON_ORE_BLOCK, STONE_BLOCK,
+    };
 
     fn world_with_dirty_chunk(coord: ChunkCoord) -> VoxelWorld {
         let mut world = VoxelWorld::new(0);
@@ -2521,6 +3688,40 @@ mod tests {
         }
 
         world
+    }
+
+    fn full_stone_chunk(coord: ChunkCoord) -> Chunk {
+        Chunk::from_blocks(coord, Box::new([STONE_BLOCK; CHUNK_VOLUME]), 0)
+    }
+
+    fn world_with_floor() -> VoxelWorld {
+        let mut world = world_with_empty_chunks([ChunkCoord::new(0, 0, 0)]);
+
+        for x in 0..4 {
+            for z in 0..4 {
+                world.set_block(BlockPos::new(x, 0, z), STONE_BLOCK);
+            }
+        }
+
+        world
+    }
+
+    fn test_ray_hit(world_block: BlockPos, block_id: BlockId) -> physics::VoxelRayHit {
+        physics::VoxelRayHit {
+            world_block,
+            chunk_coord: world_to_chunk_coord(world_block.x, world_block.y, world_block.z),
+            local_block: (0, 0, 0),
+            block_id,
+            face_normal: [-1, 0, 0],
+            distance: 1.0,
+        }
+    }
+
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.0001,
+            "expected {expected}, got {actual}"
+        );
     }
 
     #[test]
@@ -2614,6 +3815,18 @@ mod tests {
     }
 
     #[test]
+    fn settings_layout_has_fov_field() {
+        let layout = build_menu_layout(
+            AppScreen::Settings,
+            &SettingsInputs::from_settings(GameSettings::default()),
+            None,
+            PhysicalSize::new(1280, 720),
+        );
+
+        assert!(layout.hits.iter().any(|hit| hit.action == MenuAction::Fov));
+    }
+
+    #[test]
     fn active_settings_textbox_adds_visual_highlight_geometry() {
         let settings_inputs = SettingsInputs::from_settings(GameSettings::default());
         let inactive = build_menu_layout(
@@ -2633,6 +3846,130 @@ mod tests {
     }
 
     #[test]
+    fn settings_parsers_clamp_long_user_values() {
+        assert_eq!(
+            parse_clamped_i32_setting(
+                "999999999999999999999999",
+                config::DEFAULT_RENDER_CHUNK_DISTANCE,
+                config::MIN_RENDER_CHUNK_DISTANCE,
+                config::MAX_RENDER_CHUNK_DISTANCE,
+            ),
+            config::MAX_RENDER_CHUNK_DISTANCE
+        );
+        assert_eq!(
+            parse_clamped_f32_setting(
+                "999999999999999999999999.0",
+                config::DEFAULT_FOV_DEGREES,
+                config::MIN_FOV_DEGREES,
+                config::MAX_FOV_DEGREES,
+            ),
+            config::MAX_FOV_DEGREES
+        );
+    }
+
+    #[test]
+    fn gameplay_overlay_draws_hotbar_slots() {
+        let overlay =
+            build_gameplay_overlay(&Hotbar::starter(), None, PhysicalSize::new(1280, 720));
+
+        assert!(overlay.items.len() >= HOTBAR_SLOT_COUNT * 4);
+    }
+
+    #[test]
+    fn gameplay_overlay_hides_break_progress_when_not_breaking() {
+        let hidden = build_gameplay_overlay(&Hotbar::starter(), None, PhysicalSize::new(1280, 720));
+        let visible =
+            build_gameplay_overlay(&Hotbar::starter(), Some(0.45), PhysicalSize::new(1280, 720));
+
+        assert!(visible.items.len() > hidden.items.len());
+    }
+
+    #[test]
+    fn loading_overlay_draws_blank_screen_and_progress_bar() {
+        let overlay = build_loading_overlay(0.5, PhysicalSize::new(1280, 720));
+
+        assert!(overlay.items.len() >= 4);
+        assert!(matches!(
+            overlay.items.first(),
+            Some(UiOverlayItem::Rect(rect)) if rect.color == [0.0, 0.0, 0.0, 1.0]
+        ));
+    }
+
+    #[test]
+    fn initial_world_preload_coords_include_center_and_respect_cap() {
+        let camera = VoxelCamera::looking_at_chunk_origin();
+        let center = camera_chunk_coord(camera);
+        let coords = initial_world_preload_coords(
+            WorldStreamingSettings::new(99, 99, 99, 99, 99, 100),
+            camera,
+            PhysicalSize::new(1280, 720),
+        );
+
+        assert!(coords.contains(&center));
+        assert!(coords.len() <= config::INITIAL_WORLD_PRELOAD_CHUNK_LIMIT + 1);
+    }
+
+    #[test]
+    fn gameplay_overlay_uses_texture_rects_for_hotbar_blocks() {
+        let overlay =
+            build_gameplay_overlay(&Hotbar::starter(), None, PhysicalSize::new(1280, 720));
+
+        assert!(overlay
+            .items
+            .iter()
+            .any(|item| matches!(item, UiOverlayItem::Texture(_))));
+    }
+
+    #[test]
+    fn break_progress_is_quantized_to_percent_steps() {
+        assert_eq!(quantize_break_progress(-1.0), 0);
+        assert_eq!(quantize_break_progress(0.456), 46);
+        assert_eq!(quantize_break_progress(2.0), 100);
+    }
+
+    #[test]
+    fn block_ui_labels_match_starter_hotbar_blocks() {
+        assert_eq!(block_ui_label(DIRT_BLOCK), "DIRT");
+        assert_eq!(block_ui_label(GRASS_BLOCK), "GRASS");
+        assert_eq!(block_ui_label(STONE_BLOCK), "STONE");
+        assert_eq!(block_ui_label(COAL_ORE_BLOCK), "COAL ORE");
+        assert_eq!(block_ui_label(IRON_ORE_BLOCK), "IRON ORE");
+        assert_eq!(block_ui_label(AIR_BLOCK), "EMPTY");
+    }
+
+    #[test]
+    fn block_ui_colors_come_from_block_config() {
+        assert_eq!(block_ui_color(DIRT_BLOCK), block_color_rgba(DIRT_BLOCK));
+        assert_eq!(
+            block_ui_color(IRON_ORE_BLOCK),
+            block_color_rgba(IRON_ORE_BLOCK)
+        );
+    }
+
+    #[test]
+    fn block_break_state_accumulates_damage_until_block_hp_is_reached() {
+        let mut breaking = BlockBreakState::default();
+        let hit = test_ray_hit(BlockPos::new(3, 0, 0), STONE_BLOCK);
+        let block_hp = block_break_hp(STONE_BLOCK);
+
+        assert!(!breaking.apply_damage(hit, block_hp, block_hp * 0.5));
+        assert!(!breaking.apply_damage(hit, block_hp, block_hp * 0.49));
+        assert!(breaking.apply_damage(hit, block_hp, block_hp * 0.01));
+    }
+
+    #[test]
+    fn block_break_state_retargeting_resets_accumulated_damage() {
+        let mut breaking = BlockBreakState::default();
+        let first_hit = test_ray_hit(BlockPos::new(3, 0, 0), DIRT_BLOCK);
+        let second_hit = test_ray_hit(BlockPos::new(4, 0, 0), DIRT_BLOCK);
+        let block_hp = block_break_hp(DIRT_BLOCK);
+
+        assert!(!breaking.apply_damage(first_hit, block_hp, block_hp * 0.9));
+        assert!(!breaking.apply_damage(second_hit, block_hp, block_hp * 0.2));
+        assert!(breaking.apply_damage(second_hit, block_hp, block_hp * 0.8));
+    }
+
+    #[test]
     fn camera_block_position_floors_negative_coordinates() {
         assert_eq!(
             camera_block_position([-0.1, 42.9, -32.0]),
@@ -2643,12 +3980,82 @@ mod tests {
     #[test]
     fn streaming_chunk_coords_start_with_nearest_chunk() {
         let center = ChunkCoord::new(4, -2, 7);
-        let coords = streaming_chunk_coords(center, WorldStreamingSettings::prototype());
+        let coords = streaming_chunk_coords(
+            center,
+            WorldStreamingSettings::prototype(),
+            VoxelCamera::looking_at_chunk_origin(),
+            PhysicalSize::new(1280, 720),
+        );
 
-        assert_eq!(coords.len(), 15);
         assert_eq!(coords.front().copied(), Some(center));
-        assert!(coords.contains(&center.offset(1, 1, 0)));
+        assert!(coords.contains(&center.offset(0, 1, 0)));
         assert!(!coords.contains(&center.offset(1, 1, -1)));
+    }
+
+    #[test]
+    fn streaming_chunk_coords_reach_high_visible_distances() {
+        let center = ChunkCoord::new(0, 0, 0);
+        let settings = WorldStreamingSettings::new(99, 99, 99, 99, 99, 100);
+        let mut camera = VoxelCamera::new([16.0, 16.0, 16.0], 0.0, 0.0);
+        camera.fov_y_radians = 70.0_f32.to_radians();
+        let coords = streaming_chunk_coords(center, settings, camera, PhysicalSize::new(1280, 720));
+
+        assert!(coords.contains(&center.offset(99, 0, 0)));
+    }
+
+    #[test]
+    fn streaming_chunk_coords_prioritize_front_to_back_depth() {
+        let center = ChunkCoord::new(0, 0, 0);
+        let settings = WorldStreamingSettings::new(12, 12, 12, 12, 12, 13);
+        let camera = VoxelCamera::new([16.0, 16.0, 16.0], 0.0, 0.0);
+        let coords = streaming_chunk_coords(center, settings, camera, PhysicalSize::new(1280, 720));
+        let near = center.offset(1, 0, 0);
+        let far = center.offset(8, 0, 0);
+        let near_index = coords
+            .iter()
+            .position(|coord| *coord == near)
+            .expect("near forward chunk should be streamed");
+        let far_index = coords
+            .iter()
+            .position(|coord| *coord == far)
+            .expect("far forward chunk should be streamed");
+
+        assert!(near_index < far_index);
+    }
+
+    #[test]
+    fn visible_ray_streaming_does_not_walk_into_deep_underground_chunks() {
+        let center = ChunkCoord::new(0, 1, 0);
+        let settings = WorldStreamingSettings::new(32, 32, 32, 32, 32, 33);
+        let mut camera = VoxelCamera::new([16.0, 48.0, 16.0], 0.0, -55.0_f32.to_radians());
+        camera.fov_y_radians = 70.0_f32.to_radians();
+        let coords = streaming_chunk_coords(center, settings, camera, PhysicalSize::new(1280, 720));
+
+        let near_radius_sq =
+            config::STREAMING_NEAR_CHUNK_RADIUS * config::STREAMING_NEAR_CHUNK_RADIUS;
+
+        assert!(!coords
+            .iter()
+            .any(|coord| coord.y < 0 && chunk_distance_key(center, *coord) > near_radius_sq));
+    }
+
+    #[test]
+    fn streaming_skips_far_chunks_hidden_behind_loaded_surface_chunks() {
+        let blocker = ChunkCoord::new(1, 0, 0);
+        let target = ChunkCoord::new(4, 0, 0);
+        let mut world = world_with_empty_chunks([blocker]);
+        let camera = VoxelCamera::new([16.0, 16.0, 16.0], 0.0, 0.0);
+
+        world.set_block(BlockPos::new(32, 0, 0), STONE_BLOCK);
+
+        assert!(streaming_coord_occluded_by_loaded_world(
+            &world, camera, target
+        ));
+        assert!(!streaming_coord_occluded_by_loaded_world(
+            &world,
+            camera,
+            ChunkCoord::new(2, 0, 0)
+        ));
     }
 
     #[test]
@@ -2657,12 +4064,96 @@ mod tests {
         let mut state = ChunkStreamingState::new(WorldStreamingSettings::prototype());
         let world = world_with_empty_chunks([center]);
 
-        assert!(state.update_center(center));
+        assert!(state.update_view(
+            center,
+            VoxelCamera::looking_at_chunk_origin(),
+            PhysicalSize::new(1280, 720)
+        ));
 
         let first_missing = state.pop_missing(&world);
 
         assert_ne!(first_missing, Some(center));
-        assert_eq!(state.pending_count(), 13);
+        assert!(state.pending_count() > 0);
+    }
+
+    #[test]
+    fn chunk_render_distance_uses_full_3d_radius() {
+        let center = ChunkCoord::new(0, 0, 0);
+        let settings = WorldStreamingSettings::new(8, 8, 8, 8, 8, 9);
+
+        assert!(chunk_within_render_distance(
+            center,
+            center.offset(0, 8, 0),
+            settings
+        ));
+        assert!(!chunk_within_render_distance(
+            center,
+            center.offset(6, 6, 0),
+            settings
+        ));
+    }
+
+    #[test]
+    fn render_skin_requires_sky_exposed_surface() {
+        let surface = ChunkCoord::new(0, 0, 0);
+        let empty = ChunkCoord::new(1, 0, 0);
+        let buried = ChunkCoord::new(5, -1, 0);
+        let above_buried = buried.offset(0, 1, 0);
+        let mut world = VoxelWorld::new(0);
+        let mut surface_chunk = Chunk::new_empty(surface);
+
+        surface_chunk.set_block(0, 0, 0, STONE_BLOCK);
+        surface_chunk.clear_dirty();
+
+        world.chunks.insert(surface, surface_chunk);
+        world.chunks.insert(empty, Chunk::new_empty(empty));
+        world.chunks.insert(buried, full_stone_chunk(buried));
+        world
+            .chunks
+            .insert(above_buried, full_stone_chunk(above_buried));
+
+        assert!(chunk_is_render_skin(&world, surface));
+        assert!(!chunk_is_render_skin(&world, empty));
+        assert!(!chunk_is_render_skin(&world, buried));
+    }
+
+    #[test]
+    fn render_candidate_retains_chunks_without_current_frustum_visibility() {
+        let center = ChunkCoord::new(0, 0, 0);
+        let behind = center.offset(-1, 0, 0);
+        let world = world_with_dirty_chunk(behind);
+        let settings = WorldStreamingSettings::new(8, 8, 8, 8, 8, 9);
+
+        assert!(chunk_is_render_candidate(&world, center, behind, settings));
+    }
+
+    #[test]
+    fn dirty_mesh_queue_prioritizes_nearer_forward_chunks() {
+        let center = ChunkCoord::new(0, 0, 0);
+        let near = center.offset(1, 0, 0);
+        let far = center.offset(8, 0, 0);
+        let mut world = VoxelWorld::new(0);
+        let settings = WorldStreamingSettings::new(12, 12, 12, 12, 12, 13);
+        let camera = VoxelCamera::new([16.0, 16.0, 16.0], 0.0, 0.0);
+        let mut queue = DirtyMeshQueue::default();
+
+        world.chunks.insert(near, {
+            let mut chunk = Chunk::new_empty(near);
+            chunk.set_block(0, 0, 0, STONE_BLOCK);
+            chunk
+        });
+        world.chunks.insert(far, {
+            let mut chunk = Chunk::new_empty(far);
+            chunk.set_block(0, 0, 0, STONE_BLOCK);
+            chunk
+        });
+
+        queue.enqueue(far);
+        queue.enqueue(near);
+        queue.prioritize(&world, camera, ChunkVisibility::all(), center, settings);
+
+        assert_eq!(queue.pop_dirty(&world), Some(near));
+        assert_eq!(queue.pop_dirty(&world), Some(far));
     }
 
     #[test]
@@ -2670,10 +4161,12 @@ mod tests {
         let too_low = GameSettings::from_saved(SavedSettings {
             mouse_sensitivity: config::DEFAULT_MOUSE_SENSITIVITY,
             render_chunk_distance: 1,
+            fov_degrees: 1.0,
         });
         let too_high = GameSettings::from_saved(SavedSettings {
             mouse_sensitivity: config::DEFAULT_MOUSE_SENSITIVITY,
-            render_chunk_distance: 99,
+            render_chunk_distance: 999,
+            fov_degrees: 999.0,
         });
 
         assert_eq!(
@@ -2684,7 +4177,12 @@ mod tests {
             too_high.chunk_view_distance,
             config::MAX_RENDER_CHUNK_DISTANCE
         );
-        assert!(too_high.streaming_settings().vertical_load_radius <= 2);
+        assert_eq!(too_low.fov_degrees, config::MIN_FOV_DEGREES);
+        assert_eq!(too_high.fov_degrees, config::MAX_FOV_DEGREES);
+        assert_eq!(
+            too_high.streaming_settings().vertical_load_radius,
+            config::MAX_RENDER_CHUNK_DISTANCE
+        );
     }
 
     #[test]
@@ -2720,15 +4218,181 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_movement_uses_camera_yaw() {
-        let mut input = InputState { forward: true, ..Default::default() };
+    fn camera_settings_apply_fov_in_degrees() {
+        let settings = GameSettings {
+            fov_degrees: 95.0,
+            ..GameSettings::default()
+        };
+        let camera = camera_with_settings(VoxelCamera::looking_at_chunk_origin(), settings);
 
-        assert_eq!(horizontal_movement(0.0, input), (1.0, 0.0));
+        assert!((camera.fov_y_radians - 95.0_f32.to_radians()).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn player_accelerates_toward_air_move_speed_when_not_grounded() {
+        let world = VoxelWorld::new(0);
+        let mut player = PlayerController::from_camera(VoxelCamera::looking_at_chunk_origin());
+        let input = InputState {
+            forward: true,
+            ..Default::default()
+        };
+
+        player.step(&world, 0.0, input, 1.0);
+
+        assert_eq!(player.velocity[0], config::PLAYER_IN_AIR_MOVE_SPEED);
+    }
+
+    #[test]
+    fn player_preserves_air_velocity_without_input() {
+        let world = VoxelWorld::new(0);
+        let mut player = PlayerController::from_camera(VoxelCamera::looking_at_chunk_origin());
+        player.velocity = [7.0, 0.0, 0.0];
+
+        player.step(&world, 0.0, InputState::default(), 0.01);
+
+        assert_eq!(player.velocity[0], 7.0);
+    }
+
+    #[test]
+    fn horizontal_velocity_integrates_acceleration_toward_target() {
+        let velocity = integrate_horizontal_velocity((1.0, 0.0), (5.0, 0.0), 10.0, 0.05);
+
+        assert_f32_close(velocity.0, 3.0);
+        assert_eq!(velocity.1, 0.0);
+    }
+
+    #[test]
+    fn air_velocity_does_not_decrease_toward_lower_target_speed() {
+        let velocity = integrate_air_horizontal_velocity(
+            (config::PLAYER_SPRINT_SPEED, 0.0),
+            (config::PLAYER_IN_AIR_MOVE_SPEED, 0.0),
+            config::PLAYER_MOVE_ACCELERATION,
+            0.01,
+        );
+
+        assert_f32_close(horizontal_speed(velocity), config::PLAYER_SPRINT_SPEED);
+    }
+
+    #[test]
+    fn air_velocity_can_steer_without_losing_speed() {
+        let velocity = integrate_air_horizontal_velocity(
+            (config::PLAYER_SPRINT_SPEED, 0.0),
+            (0.0, config::PLAYER_IN_AIR_MOVE_SPEED),
+            config::PLAYER_MOVE_ACCELERATION,
+            0.01,
+        );
+
+        assert_f32_close(horizontal_speed(velocity), config::PLAYER_SPRINT_SPEED);
+        assert!(velocity.0 < config::PLAYER_SPRINT_SPEED);
+        assert!(velocity.1 > 0.0);
+    }
+
+    #[test]
+    fn player_accelerates_toward_sprint_speed_when_supported_on_ground() {
+        let world = world_with_floor();
+        let mut player = PlayerController {
+            center: [0.5, 1.901, 0.5],
+            velocity: [0.0; 3],
+            on_ground: false,
+        };
+        let input = InputState {
+            forward: true,
+            fast: true,
+            ..Default::default()
+        };
+
+        let dt = 0.01;
+        player.step(&world, 0.0, input, dt);
+
+        assert_f32_close(
+            player.velocity[0],
+            config::PLAYER_SPRINT_SPEED * config::PLAYER_MOVE_ACCELERATION * dt,
+        );
+        assert!(player.velocity[0] < config::PLAYER_SPRINT_SPEED);
+        assert!(player.on_ground);
+    }
+
+    #[test]
+    fn player_uses_walk_target_when_sprinting_sideways() {
+        let world = world_with_floor();
+        let mut player = PlayerController {
+            center: [0.5, 1.901, 0.5],
+            velocity: [0.0; 3],
+            on_ground: false,
+        };
+        let input = InputState {
+            right: true,
+            fast: true,
+            ..Default::default()
+        };
+
+        player.step(&world, 0.0, input, 1.0);
+
+        assert_eq!(player.velocity[2], config::PLAYER_WALK_SPEED);
+        assert!(player.velocity[2] < config::PLAYER_SPRINT_SPEED);
+    }
+
+    #[test]
+    fn player_sprints_forward_while_strafing_at_walk_speed() {
+        let world = world_with_floor();
+        let mut player = PlayerController {
+            center: [0.5, 1.901, 0.5],
+            velocity: [0.0; 3],
+            on_ground: false,
+        };
+        let input = InputState {
+            forward: true,
+            right: true,
+            fast: true,
+            ..Default::default()
+        };
+
+        player.step(&world, 0.0, input, 1.0);
+
+        assert_eq!(player.velocity[0], config::PLAYER_SPRINT_SPEED);
+        assert_eq!(player.velocity[2], config::PLAYER_WALK_SPEED);
+    }
+
+    #[test]
+    fn player_decelerates_toward_crouch_speed_when_supported_on_ground() {
+        let world = world_with_floor();
+        let mut player = PlayerController {
+            center: [0.5, 1.901, 0.5],
+            velocity: [config::PLAYER_WALK_SPEED, 0.0, 0.0],
+            on_ground: false,
+        };
+        let input = InputState {
+            forward: true,
+            slow: true,
+            ..Default::default()
+        };
+
+        player.step(&world, 0.0, input, 0.01);
+
+        assert!(player.velocity[0] < config::PLAYER_WALK_SPEED);
+        assert!(player.velocity[0] > config::PLAYER_CROUCH_SPEED);
+        assert!(player.on_ground);
+    }
+
+    #[test]
+    fn horizontal_target_velocity_uses_camera_yaw() {
+        let mut input = InputState {
+            forward: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            horizontal_target_velocity(0.0, input, true),
+            (config::PLAYER_WALK_SPEED, 0.0)
+        );
 
         input.forward = false;
         input.right = true;
 
-        assert_eq!(horizontal_movement(0.0, input), (0.0, 1.0));
+        assert_eq!(
+            horizontal_target_velocity(0.0, input, true),
+            (0.0, config::PLAYER_WALK_SPEED)
+        );
     }
 
     #[test]
@@ -2810,7 +4474,7 @@ mod tests {
             } => {
                 assert_eq!(result_coord, coord);
                 assert_eq!(result_revision, revision);
-                assert_eq!(mesh.visible_face_count, 6);
+                assert_eq!(mesh.visible_face_count, 3);
                 assert_eq!(priority, MeshJobPriority::Normal);
             }
             ChunkJobResult::Generated { .. } => panic!("expected mesh result"),

@@ -1,8 +1,8 @@
 use foundation::{BlockPos, ChunkCoord};
 use std::ops::Range;
 use voxels::{
-    subchunk_bit, subchunk_index, BlockId, Chunk, AIR_BLOCK, CHUNK_SIZE, SUBCHUNK_COUNT,
-    SUBCHUNK_SIZE,
+    block_face_uv, block_is_opaque, subchunk_bit, subchunk_index, BlockId, Chunk, CubeFace,
+    AIR_BLOCK, CHUNK_SIZE, STONE_BLOCK, SUBCHUNK_COUNT, SUBCHUNK_SIZE,
 };
 use world::VoxelWorld;
 
@@ -33,6 +33,21 @@ pub struct MeshData {
 }
 
 impl MeshData {
+    fn with_block_estimate(blocks: usize) -> Self {
+        let face_capacity = if blocks <= 16 {
+            blocks * 6
+        } else {
+            (blocks / 3).clamp(64, 8192)
+        };
+
+        Self {
+            vertices: Vec::with_capacity(face_capacity * 4),
+            indices: Vec::with_capacity(face_capacity * 6),
+            visible_face_count: 0,
+            subchunk_visible_mask: 0,
+        }
+    }
+
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
@@ -46,22 +61,49 @@ pub struct ChunkMeshInput {
     pub coord: ChunkCoord,
     pub revision: u32,
     pub center: Chunk,
-    pub neighbors: [Option<Chunk>; 6],
+    pub neighbor_borders: NeighborBorders,
 }
 
 impl ChunkMeshInput {
     pub fn from_world(world: &VoxelWorld, coord: ChunkCoord) -> Option<Self> {
         let center = world.get_chunk(coord)?.clone();
         let revision = center.revision;
-        let neighbors = neighbor_chunk_coords(coord)
-            .map(|neighbor_coord| world.get_chunk(neighbor_coord).cloned());
+        let neighbor_borders = NeighborBorders::from_world(world, coord);
 
         Some(Self {
             coord,
             revision,
             center,
-            neighbors,
+            neighbor_borders,
         })
+    }
+}
+
+type ChunkBorder = Box<[BlockId; CHUNK_BORDER_BLOCKS]>;
+
+const CHUNK_BORDER_BLOCKS: usize = CHUNK_SIZE * CHUNK_SIZE;
+
+pub struct NeighborBorders {
+    borders: [Option<ChunkBorder>; 6],
+}
+
+impl NeighborBorders {
+    fn from_world(world: &VoxelWorld, coord: ChunkCoord) -> Self {
+        let borders = neighbor_chunk_coords(coord).map(|(direction, neighbor_coord)| {
+            world
+                .get_chunk(neighbor_coord)
+                .map(|chunk| capture_neighbor_border(chunk, direction))
+        });
+
+        Self { borders }
+    }
+
+    fn block(&self, direction: Direction, x: usize, y: usize, z: usize) -> BlockId {
+        let Some(border) = self.borders[direction.neighbor_index()].as_ref() else {
+            return STONE_BLOCK;
+        };
+
+        border[border_sample_index(direction, x, y, z)]
     }
 }
 
@@ -72,7 +114,7 @@ pub fn mesh_chunk(world: &VoxelWorld, coord: ChunkCoord) -> Option<MeshData> {
         return Some(MeshData::default());
     }
 
-    let mut mesh = MeshData::default();
+    let mut mesh = MeshData::with_block_estimate(chunk.solid_block_count as usize);
     mesh_block_range(
         chunk,
         coord,
@@ -91,7 +133,7 @@ pub fn mesh_chunk_input(input: &ChunkMeshInput) -> MeshData {
         return MeshData::default();
     }
 
-    let mut mesh = MeshData::default();
+    let mut mesh = MeshData::with_block_estimate(input.center.solid_block_count as usize);
     mesh_block_range(
         &input.center,
         input.coord,
@@ -117,7 +159,7 @@ pub fn mesh_subchunk(world: &VoxelWorld, coord: ChunkCoord, subchunk: usize) -> 
     }
 
     let (x_range, y_range, z_range) = subchunk_ranges(subchunk);
-    let mut mesh = MeshData::default();
+    let mut mesh = MeshData::with_block_estimate(chunk.subchunk_solid_counts[subchunk] as usize);
 
     mesh_block_range(
         chunk,
@@ -186,7 +228,7 @@ fn mesh_block_range(
                 for dir in ALL_DIRECTIONS {
                     let neighbor = neighbor_block(chunk, coord, x, y, z, dir);
 
-                    if neighbor == AIR_BLOCK {
+                    if !block_is_opaque(neighbor) {
                         let subchunk = subchunk_index(x, y, z);
                         mesh.subchunk_visible_mask |= subchunk_bit(subchunk);
                         add_face(mesh, world_pos, dir, block);
@@ -197,15 +239,80 @@ fn mesh_block_range(
     }
 }
 
-fn neighbor_chunk_coords(coord: ChunkCoord) -> [ChunkCoord; 6] {
+fn neighbor_chunk_coords(coord: ChunkCoord) -> [(Direction, ChunkCoord); 6] {
     [
-        coord.offset(1, 0, 0),
-        coord.offset(-1, 0, 0),
-        coord.offset(0, 1, 0),
-        coord.offset(0, -1, 0),
-        coord.offset(0, 0, 1),
-        coord.offset(0, 0, -1),
+        (Direction::PosX, coord.offset(1, 0, 0)),
+        (Direction::NegX, coord.offset(-1, 0, 0)),
+        (Direction::PosY, coord.offset(0, 1, 0)),
+        (Direction::NegY, coord.offset(0, -1, 0)),
+        (Direction::PosZ, coord.offset(0, 0, 1)),
+        (Direction::NegZ, coord.offset(0, 0, -1)),
     ]
+}
+
+fn capture_neighbor_border(chunk: &Chunk, direction: Direction) -> ChunkBorder {
+    let mut border = Box::new([AIR_BLOCK; CHUNK_BORDER_BLOCKS]);
+
+    match direction {
+        Direction::PosX => {
+            for y in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    border[border_axis_index(y, z)] = chunk.get_block(0, y, z);
+                }
+            }
+        }
+        Direction::NegX => {
+            for y in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    border[border_axis_index(y, z)] = chunk.get_block(CHUNK_SIZE - 1, y, z);
+                }
+            }
+        }
+        Direction::PosY => {
+            for x in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    border[border_axis_index(x, z)] = chunk.get_block(x, 0, z);
+                }
+            }
+        }
+        Direction::NegY => {
+            for x in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    border[border_axis_index(x, z)] = chunk.get_block(x, CHUNK_SIZE - 1, z);
+                }
+            }
+        }
+        Direction::PosZ => {
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    border[border_axis_index(x, y)] = chunk.get_block(x, y, 0);
+                }
+            }
+        }
+        Direction::NegZ => {
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    border[border_axis_index(x, y)] = chunk.get_block(x, y, CHUNK_SIZE - 1);
+                }
+            }
+        }
+    }
+
+    border
+}
+
+#[inline(always)]
+const fn border_axis_index(a: usize, b: usize) -> usize {
+    a + b * CHUNK_SIZE
+}
+
+#[inline(always)]
+const fn border_sample_index(direction: Direction, x: usize, y: usize, z: usize) -> usize {
+    match direction {
+        Direction::PosX | Direction::NegX => border_axis_index(y, z),
+        Direction::PosY | Direction::NegY => border_axis_index(x, z),
+        Direction::PosZ | Direction::NegZ => border_axis_index(x, y),
+    }
 }
 
 fn subchunk_ranges(subchunk: usize) -> (Range<usize>, Range<usize>, Range<usize>) {
@@ -271,26 +378,8 @@ fn snapshot_neighbor_block(
         Direction::NegY if y > 0 => chunk.get_block(x, y - 1, z),
         Direction::PosZ if z + 1 < CHUNK_SIZE => chunk.get_block(x, y, z + 1),
         Direction::NegZ if z > 0 => chunk.get_block(x, y, z - 1),
-        Direction::PosX => snapshot_neighbor_chunk_block(input, 0, 0, y, z),
-        Direction::NegX => snapshot_neighbor_chunk_block(input, 1, CHUNK_SIZE - 1, y, z),
-        Direction::PosY => snapshot_neighbor_chunk_block(input, 2, x, 0, z),
-        Direction::NegY => snapshot_neighbor_chunk_block(input, 3, x, CHUNK_SIZE - 1, z),
-        Direction::PosZ => snapshot_neighbor_chunk_block(input, 4, x, y, 0),
-        Direction::NegZ => snapshot_neighbor_chunk_block(input, 5, x, y, CHUNK_SIZE - 1),
+        direction => input.neighbor_borders.block(direction, x, y, z),
     }
-}
-
-fn snapshot_neighbor_chunk_block(
-    input: &ChunkMeshInput,
-    neighbor_index: usize,
-    x: usize,
-    y: usize,
-    z: usize,
-) -> BlockId {
-    input.neighbors[neighbor_index]
-        .as_ref()
-        .map(|chunk| chunk.get_block(x, y, z))
-        .unwrap_or(AIR_BLOCK)
 }
 
 fn neighbor_chunk_block(
@@ -303,7 +392,7 @@ fn neighbor_chunk_block(
     world
         .get_chunk(coord)
         .map(|chunk| chunk.get_block(x, y, z))
-        .unwrap_or(AIR_BLOCK)
+        .unwrap_or(STONE_BLOCK)
 }
 
 fn add_face(mesh: &mut MeshData, pos: BlockPos, dir: Direction, block_id: BlockId) {
@@ -331,13 +420,14 @@ fn add_face(mesh: &mut MeshData, pos: BlockPos, dir: Direction, block_id: BlockI
         Direction::NegZ => ([0.0, 0.0, -1.0], [p000, p100, p110, p010]),
     };
 
-    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let local_uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let face = cube_face(dir);
 
     for i in 0..4 {
         mesh.vertices.push(Vertex {
             position: positions[i],
             normal,
-            uv: uvs[i],
+            uv: block_face_uv(block_id, face, local_uvs[i]).unwrap_or(local_uvs[i]),
             block_id,
         });
     }
@@ -352,6 +442,30 @@ fn add_face(mesh: &mut MeshData, pos: BlockPos, dir: Direction, block_id: BlockI
     ]);
 
     mesh.visible_face_count += 1;
+}
+
+fn cube_face(direction: Direction) -> CubeFace {
+    match direction {
+        Direction::PosX => CubeFace::PosX,
+        Direction::NegX => CubeFace::NegX,
+        Direction::PosY => CubeFace::PosY,
+        Direction::NegY => CubeFace::NegY,
+        Direction::PosZ => CubeFace::PosZ,
+        Direction::NegZ => CubeFace::NegZ,
+    }
+}
+
+impl Direction {
+    const fn neighbor_index(self) -> usize {
+        match self {
+            Direction::PosX => 0,
+            Direction::NegX => 1,
+            Direction::PosY => 2,
+            Direction::NegY => 3,
+            Direction::PosZ => 4,
+            Direction::NegZ => 5,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -378,7 +492,7 @@ mod tests {
         let coord = ChunkCoord::new(0, 0, 0);
         let mut world = world_with_empty_chunk(coord);
 
-        world.set_block(BlockPos::new(0, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(1, 1, 1), STONE_BLOCK);
 
         let mesh = mesh_chunk(&world, coord).expect("chunk exists");
 
@@ -395,8 +509,8 @@ mod tests {
         let coord = ChunkCoord::new(0, 0, 0);
         let mut world = world_with_empty_chunk(coord);
 
-        world.set_block(BlockPos::new(0, 0, 0), STONE_BLOCK);
-        world.set_block(BlockPos::new(1, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(1, 1, 1), STONE_BLOCK);
+        world.set_block(BlockPos::new(2, 1, 1), STONE_BLOCK);
 
         let mesh = mesh_chunk(&world, coord).expect("chunk exists");
 
@@ -410,7 +524,7 @@ mod tests {
         let coord = ChunkCoord::new(0, 0, 0);
         let mut world = world_with_empty_chunk(coord);
 
-        world.set_block(BlockPos::new(17, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(17, 1, 1), STONE_BLOCK);
 
         let empty_mesh = mesh_subchunk(&world, coord, 0).expect("chunk exists");
         let filled_mesh = mesh_subchunk(&world, coord, 1).expect("chunk exists");
@@ -427,12 +541,12 @@ mod tests {
         let coord = ChunkCoord::new(0, 0, 0);
         let mut world = world_with_empty_chunk(coord);
 
-        world.set_block(BlockPos::new(17, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(17, 1, 1), STONE_BLOCK);
 
         let meshes = mesh_dirty_subchunks(&world, coord).expect("chunk exists");
 
         assert_eq!(meshes.len(), 1);
-        assert_eq!(meshes[0].0, subchunk_index(17, 0, 0));
+        assert_eq!(meshes[0].0, subchunk_index(17, 1, 1));
         assert_eq!(meshes[0].1.visible_face_count, 6);
         assert_eq!(meshes[0].1.subchunk_visible_mask, subchunk_bit(1));
     }
@@ -442,13 +556,13 @@ mod tests {
         let coord = ChunkCoord::new(0, 0, 0);
         let mut world = world_with_empty_chunk(coord);
 
-        world.set_block(BlockPos::new(15, 0, 0), STONE_BLOCK);
-        world.set_block(BlockPos::new(16, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(15, 1, 1), STONE_BLOCK);
+        world.set_block(BlockPos::new(16, 1, 1), STONE_BLOCK);
 
         let left_mesh =
-            mesh_subchunk(&world, coord, subchunk_index(15, 0, 0)).expect("chunk exists");
+            mesh_subchunk(&world, coord, subchunk_index(15, 1, 1)).expect("chunk exists");
         let right_mesh =
-            mesh_subchunk(&world, coord, subchunk_index(16, 0, 0)).expect("chunk exists");
+            mesh_subchunk(&world, coord, subchunk_index(16, 1, 1)).expect("chunk exists");
 
         assert_eq!(left_mesh.visible_face_count, 5);
         assert_eq!(right_mesh.visible_face_count, 5);
@@ -465,16 +579,16 @@ mod tests {
             .chunks
             .insert(neighbor_coord, Chunk::new_empty(neighbor_coord));
 
-        world.set_block(BlockPos::new(31, 0, 0), STONE_BLOCK);
-        world.set_block(BlockPos::new(32, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(31, 16, 16), STONE_BLOCK);
+        world.set_block(BlockPos::new(32, 16, 16), STONE_BLOCK);
 
         let origin_mesh = mesh_chunk(&world, coord).expect("origin chunk exists");
         let neighbor_mesh = mesh_chunk(&world, neighbor_coord).expect("neighbor chunk exists");
 
         assert_eq!(origin_mesh.visible_face_count, 5);
         assert_eq!(neighbor_mesh.visible_face_count, 5);
-        assert_eq!(origin_mesh.subchunk_visible_mask, subchunk_bit(1));
-        assert_eq!(neighbor_mesh.subchunk_visible_mask, subchunk_bit(0));
+        assert_eq!(origin_mesh.subchunk_visible_mask, subchunk_bit(7));
+        assert_eq!(neighbor_mesh.subchunk_visible_mask, subchunk_bit(6));
     }
 
     #[test]
@@ -486,8 +600,8 @@ mod tests {
             .chunks
             .insert(neighbor_coord, Chunk::new_empty(neighbor_coord));
 
-        world.set_block(BlockPos::new(31, 0, 0), STONE_BLOCK);
-        world.set_block(BlockPos::new(32, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(31, 16, 16), STONE_BLOCK);
+        world.set_block(BlockPos::new(32, 16, 16), STONE_BLOCK);
 
         let input = ChunkMeshInput::from_world(&world, coord).expect("snapshot exists");
         let live_mesh = mesh_chunk(&world, coord).expect("live mesh exists");
@@ -506,11 +620,42 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_mesh_uses_neighbor_border_data() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let neighbor_coord = coord.offset(1, 0, 0);
+        let mut world = world_with_empty_chunk(coord);
+        world
+            .chunks
+            .insert(neighbor_coord, Chunk::new_empty(neighbor_coord));
+
+        world.set_block(BlockPos::new(31, 16, 16), STONE_BLOCK);
+        world.set_block(BlockPos::new(32, 16, 16), STONE_BLOCK);
+
+        let input = ChunkMeshInput::from_world(&world, coord).expect("snapshot exists");
+        let mesh = mesh_chunk_input(&input);
+
+        assert_eq!(mesh.visible_face_count, 5);
+    }
+
+    #[test]
+    fn snapshot_mesh_treats_missing_neighbor_borders_as_occluding() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_empty_chunk(coord);
+
+        world.set_block(BlockPos::new(31, 0, 0), STONE_BLOCK);
+
+        let input = ChunkMeshInput::from_world(&world, coord).expect("snapshot exists");
+        let mesh = mesh_chunk_input(&input);
+
+        assert_eq!(mesh.visible_face_count, 3);
+    }
+
+    #[test]
     fn generated_triangles_are_wound_toward_their_face_normals() {
         let coord = ChunkCoord::new(0, 0, 0);
         let mut world = world_with_empty_chunk(coord);
 
-        world.set_block(BlockPos::new(0, 0, 0), STONE_BLOCK);
+        world.set_block(BlockPos::new(1, 1, 1), STONE_BLOCK);
 
         let mesh = mesh_chunk(&world, coord).expect("chunk exists");
 

@@ -63,11 +63,60 @@ pub fn move_aabb_through_voxels(
         }
     }
 
+    if delta[1] <= 0.0 {
+        on_ground |= aabb_has_ground_support(world, center, half_extents, COLLISION_EPSILON * 4.0);
+    }
+
     AabbCollisionResult {
         center,
         collided,
         on_ground,
     }
+}
+
+pub fn aabb_has_ground_support(
+    world: &VoxelWorld,
+    center: [f32; 3],
+    half_extents: [f32; 3],
+    max_distance: f32,
+) -> bool {
+    if max_distance <= 0.0 {
+        return false;
+    }
+
+    let bounds = aabb_bounds(center, half_extents);
+    let probe_min = [
+        bounds.0[0] + COLLISION_EPSILON,
+        bounds.0[1] - max_distance,
+        bounds.0[2] + COLLISION_EPSILON,
+    ];
+    let probe_max = [
+        bounds.1[0] - COLLISION_EPSILON,
+        bounds.0[1] + COLLISION_EPSILON,
+        bounds.1[2] - COLLISION_EPSILON,
+    ];
+    let min_block = block_floor(probe_min);
+    let max_block = block_floor([
+        probe_max[0] - COLLISION_EPSILON,
+        probe_max[1] - COLLISION_EPSILON,
+        probe_max[2] - COLLISION_EPSILON,
+    ]);
+    let probe_bounds = (probe_min, probe_max);
+
+    for y in min_block.y..=max_block.y {
+        for z in min_block.z..=max_block.z {
+            for x in min_block.x..=max_block.x {
+                let block = BlockPos::new(x, y, z);
+
+                if world.get_block(block) != AIR_BLOCK && aabb_intersects_block(probe_bounds, block)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn move_aabb_collision_step(
@@ -441,6 +490,30 @@ mod tests {
         assert!((result.center[1] - 1.901).abs() < 0.0001);
         assert_eq!(result.collided, [false, true, false]);
         assert!(result.on_ground);
+    }
+
+    #[test]
+    fn aabb_reports_ground_when_resting_on_floor() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_empty_chunk(coord);
+        world.set_block(BlockPos::new(0, 0, 0), STONE_BLOCK);
+
+        let result =
+            move_aabb_through_voxels(&world, [0.5, 1.901, 0.5], [0.3, 0.9, 0.3], [0.0, 0.0, 0.0]);
+
+        assert!(result.on_ground);
+    }
+
+    #[test]
+    fn ground_support_probe_ignores_air_beneath_player() {
+        let world = world_with_empty_chunk(ChunkCoord::new(0, 0, 0));
+
+        assert!(!aabb_has_ground_support(
+            &world,
+            [0.5, 1.901, 0.5],
+            [0.3, 0.9, 0.3],
+            0.01
+        ));
     }
 
     #[test]

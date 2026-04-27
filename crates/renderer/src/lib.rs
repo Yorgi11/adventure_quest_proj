@@ -1,7 +1,7 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{collections::HashMap, error::Error, fmt, path::Path, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
-use foundation::{Aabb, ChunkCoord};
+use foundation::{Aabb, BlockPos, ChunkCoord};
 use glam::{Mat4, Vec3};
 use meshing::MeshData;
 use voxels::CHUNK_SIZE;
@@ -50,17 +50,25 @@ pub struct VoxelRenderer {
     size: PhysicalSize<u32>,
     clear_color: wgpu::Color,
     depth_texture: DepthTexture,
+    block_atlas: BlockTextureAtlas,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera: VoxelCamera,
     render_pipeline: wgpu::RenderPipeline,
+    outline_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     ui_overlay: UiOverlay,
     overlay_text: Option<String>,
     crosshair_enabled: bool,
+    outline_vertex_buffer: Option<wgpu::Buffer>,
+    outline_vertex_count: u32,
     overlay_vertex_buffer: Option<wgpu::Buffer>,
     overlay_vertex_count: u32,
+    terrain_batch: TerrainBatch,
+    terrain_batch_key: Option<TerrainBatchKey>,
+    chunk_mesh_revision: u64,
     chunk_meshes: Vec<GpuChunkMesh>,
+    chunk_mesh_indices: HashMap<ChunkCoord, usize>,
     frustum_culling_enabled: bool,
     last_frame_stats: RenderFrameStats,
 }
@@ -88,6 +96,23 @@ pub struct RenderFrameStats {
     pub drawn_chunk_meshes: usize,
     pub culled_chunk_meshes: usize,
     pub drawn_indices: u32,
+    pub terrain_draw_calls: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkVisibility {
+    frustum: Option<CameraFrustum>,
+}
+
+impl ChunkVisibility {
+    pub const fn all() -> Self {
+        Self { frustum: None }
+    }
+
+    pub fn contains(self, coord: ChunkCoord) -> bool {
+        self.frustum
+            .is_none_or(|frustum| frustum.intersects_aabb(chunk_bounds(coord)))
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -98,6 +123,7 @@ pub struct UiOverlay {
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiOverlayItem {
     Rect(UiRect),
+    Texture(UiTextureRect),
     Text(UiText),
 }
 
@@ -118,6 +144,36 @@ impl UiRect {
             width,
             height,
             color,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiTextureRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub color: [f32; 4],
+    pub uvs: [[f32; 2]; 4],
+}
+
+impl UiTextureRect {
+    pub const fn new(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+        uvs: [[f32; 2]; 4],
+    ) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            color,
+            uvs,
         }
     }
 }
@@ -193,6 +249,12 @@ impl VoxelCamera {
         self.forward_vector().to_array()
     }
 
+    pub fn chunk_depth(self, coord: ChunkCoord) -> f32 {
+        let center = chunk_center(coord);
+
+        self.depth_sorter().depth_to_point(center)
+    }
+
     fn view_projection(self, aspect: f32) -> Mat4 {
         let eye = Vec3::from_array(self.position);
         let view = Mat4::look_to_rh(eye, self.forward_vector(), Vec3::Y);
@@ -208,6 +270,13 @@ impl VoxelCamera {
             self.yaw_radians.sin() * self.pitch_radians.cos(),
         )
         .normalize_or_zero()
+    }
+
+    fn depth_sorter(self) -> CameraDepth {
+        CameraDepth {
+            position: Vec3::from_array(self.position),
+            forward: self.forward_vector(),
+        }
     }
 }
 
@@ -283,6 +352,30 @@ impl VoxelRenderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
+        let block_texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Adventure Quest Block Texture Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let block_atlas =
+            BlockTextureAtlas::load_or_fallback(&device, &queue, &block_texture_bind_group_layout);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Adventure Quest Voxel Shader"),
@@ -290,7 +383,10 @@ impl VoxelRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Adventure Quest Voxel Pipeline Layout"),
-            bind_group_layouts: &[Some(&camera_bind_group_layout)],
+            bind_group_layouts: &[
+                Some(&camera_bind_group_layout),
+                Some(&block_texture_bind_group_layout),
+            ],
             immediate_size: 0,
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -333,6 +429,56 @@ impl VoxelRenderer {
             cache: None,
         });
 
+        let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Adventure Quest Block Outline Shader"),
+            source: wgpu::ShaderSource::Wgsl(OUTLINE_SHADER.into()),
+        });
+        let outline_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Adventure Quest Block Outline Pipeline Layout"),
+                bind_group_layouts: &[Some(&camera_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let outline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Adventure Quest Block Outline Pipeline"),
+            layout: Some(&outline_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &outline_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[OutlineVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &outline_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DepthTexture::FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Adventure Quest Overlay Shader"),
             source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER.into()),
@@ -340,7 +486,7 @@ impl VoxelRenderer {
         let overlay_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Adventure Quest Overlay Pipeline Layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[Some(&block_texture_bind_group_layout)],
                 immediate_size: 0,
             });
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -396,17 +542,25 @@ impl VoxelRenderer {
                 a: 1.0,
             },
             depth_texture,
+            block_atlas,
             camera_buffer,
             camera_bind_group,
             camera,
             render_pipeline,
+            outline_pipeline,
             overlay_pipeline,
             ui_overlay: UiOverlay::default(),
             overlay_text: None,
             crosshair_enabled: false,
+            outline_vertex_buffer: None,
+            outline_vertex_count: 0,
             overlay_vertex_buffer: None,
             overlay_vertex_count: 0,
+            terrain_batch: TerrainBatch::default(),
+            terrain_batch_key: None,
+            chunk_mesh_revision: 0,
             chunk_meshes: Vec::new(),
+            chunk_mesh_indices: HashMap::new(),
             frustum_culling_enabled: true,
             last_frame_stats: RenderFrameStats::default(),
         })
@@ -418,6 +572,8 @@ impl VoxelRenderer {
 
     pub fn upload_mesh(&mut self, mesh: &MeshData) {
         self.chunk_meshes.clear();
+        self.chunk_mesh_indices.clear();
+        self.invalidate_terrain_batch();
 
         let upload = ChunkMeshUpload {
             coord: ChunkCoord::new(0, 0, 0),
@@ -426,8 +582,10 @@ impl VoxelRenderer {
             mesh,
         };
 
-        if let Some(mesh) = GpuChunkMesh::from_upload(&self.device, upload) {
-            self.chunk_meshes.push(mesh);
+        if let Some(mesh) =
+            GpuChunkMesh::from_upload(&self.device, upload, self.block_atlas.available)
+        {
+            self.insert_chunk_mesh(mesh);
         }
     }
 
@@ -435,71 +593,97 @@ impl VoxelRenderer {
     where
         I: IntoIterator<Item = &'a MeshData>,
     {
-        self.chunk_meshes = meshes
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, mesh)| {
-                let upload = ChunkMeshUpload {
-                    coord: ChunkCoord::new(index as i32, 0, 0),
-                    revision: 0,
-                    visible_mask: mesh.subchunk_visible_mask,
-                    mesh,
-                };
+        self.chunk_meshes.clear();
+        self.chunk_mesh_indices.clear();
+        self.invalidate_terrain_batch();
 
-                GpuChunkMesh::from_upload(&self.device, upload)
-            })
-            .collect();
+        for (index, mesh) in meshes.into_iter().enumerate() {
+            let upload = ChunkMeshUpload {
+                coord: ChunkCoord::new(index as i32, 0, 0),
+                revision: 0,
+                visible_mask: mesh.subchunk_visible_mask,
+                mesh,
+            };
+
+            if let Some(mesh) =
+                GpuChunkMesh::from_upload(&self.device, upload, self.block_atlas.available)
+            {
+                self.insert_chunk_mesh(mesh);
+            }
+        }
     }
 
     pub fn upload_chunk_mesh(&mut self, upload: ChunkMeshUpload<'_>) {
-        let existing = self
-            .chunk_meshes
-            .iter()
-            .position(|mesh| mesh.coord == upload.coord);
+        let coord = upload.coord;
 
-        let Some(mesh) = GpuChunkMesh::from_upload(&self.device, upload) else {
-            if let Some(index) = existing {
-                self.chunk_meshes.remove(index);
-            }
+        let Some(mesh) =
+            GpuChunkMesh::from_upload(&self.device, upload, self.block_atlas.available)
+        else {
+            self.remove_chunk_mesh(coord);
             return;
         };
 
-        if let Some(index) = existing {
-            self.chunk_meshes[index] = mesh;
-        } else {
-            self.chunk_meshes.push(mesh);
-        }
+        self.insert_chunk_mesh(mesh);
     }
 
     pub fn upload_chunk_meshes<'a, I>(&mut self, uploads: I)
     where
         I: IntoIterator<Item = ChunkMeshUpload<'a>>,
     {
-        self.chunk_meshes = uploads
-            .into_iter()
-            .filter_map(|upload| GpuChunkMesh::from_upload(&self.device, upload))
-            .collect();
+        self.chunk_meshes.clear();
+        self.chunk_mesh_indices.clear();
+        self.invalidate_terrain_batch();
+
+        for upload in uploads {
+            if let Some(mesh) =
+                GpuChunkMesh::from_upload(&self.device, upload, self.block_atlas.available)
+            {
+                self.insert_chunk_mesh(mesh);
+            }
+        }
     }
 
     pub fn clear_chunk_meshes(&mut self) {
         self.chunk_meshes.clear();
+        self.chunk_mesh_indices.clear();
+        self.invalidate_terrain_batch();
+        self.set_block_outline(None);
     }
 
     pub fn remove_chunk_mesh(&mut self, coord: ChunkCoord) -> bool {
-        let Some(index) = self
-            .chunk_meshes
-            .iter()
-            .position(|mesh| mesh.coord == coord)
-        else {
+        let Some(index) = self.chunk_mesh_indices.remove(&coord) else {
             return false;
         };
 
-        self.chunk_meshes.remove(index);
+        self.chunk_meshes.swap_remove(index);
+
+        if let Some(swapped_mesh) = self.chunk_meshes.get(index) {
+            self.chunk_mesh_indices.insert(swapped_mesh.coord, index);
+        }
+
+        self.invalidate_terrain_batch();
         true
+    }
+
+    fn insert_chunk_mesh(&mut self, mesh: GpuChunkMesh) {
+        if let Some(index) = self.chunk_mesh_indices.get(&mesh.coord).copied() {
+            self.chunk_meshes[index] = mesh;
+            self.invalidate_terrain_batch();
+            return;
+        }
+
+        let index = self.chunk_meshes.len();
+        self.chunk_mesh_indices.insert(mesh.coord, index);
+        self.chunk_meshes.push(mesh);
+        self.invalidate_terrain_batch();
     }
 
     pub fn chunk_mesh_info(&self) -> impl Iterator<Item = ChunkMeshInfo> + '_ {
         self.chunk_meshes.iter().map(GpuChunkMesh::info)
+    }
+
+    pub fn chunk_mesh_count(&self) -> usize {
+        self.chunk_meshes.len()
     }
 
     pub const fn last_frame_stats(&self) -> RenderFrameStats {
@@ -511,7 +695,24 @@ impl VoxelRenderer {
     }
 
     pub fn set_frustum_culling_enabled(&mut self, enabled: bool) {
+        if self.frustum_culling_enabled != enabled {
+            self.invalidate_terrain_batch();
+        }
+
         self.frustum_culling_enabled = enabled;
+    }
+
+    pub fn chunk_visibility(&self, camera: VoxelCamera) -> ChunkVisibility {
+        let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
+        ChunkVisibility {
+            frustum: self
+                .frustum_culling_enabled
+                .then(|| CameraFrustum::from_camera(camera, aspect)),
+        }
+    }
+
+    pub fn chunk_visible_from_camera(&self, camera: VoxelCamera, coord: ChunkCoord) -> bool {
+        self.chunk_visibility(camera).contains(coord)
     }
 
     pub fn set_fps_overlay(&mut self, fps: Option<u32>) {
@@ -532,6 +733,25 @@ impl VoxelRenderer {
     pub fn set_crosshair_enabled(&mut self, enabled: bool) {
         self.crosshair_enabled = enabled;
         self.rebuild_overlay_buffer();
+    }
+
+    pub fn set_block_outline(&mut self, block: Option<BlockPos>) {
+        let Some(block) = block else {
+            self.outline_vertex_buffer = None;
+            self.outline_vertex_count = 0;
+            return;
+        };
+
+        let vertices = block_outline_vertices(block);
+
+        self.outline_vertex_buffer = Some(self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Adventure Quest Block Outline Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        ));
+        self.outline_vertex_count = vertices.len() as u32;
     }
 
     pub fn mesh_count(&self) -> usize {
@@ -562,9 +782,15 @@ impl VoxelRenderer {
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
         self.depth_texture = DepthTexture::new(&self.device, new_size.width, new_size.height);
+        self.invalidate_terrain_batch();
 
         self.write_camera_uniform();
         self.rebuild_overlay_buffer();
+    }
+
+    fn invalidate_terrain_batch(&mut self) {
+        self.chunk_mesh_revision = self.chunk_mesh_revision.wrapping_add(1);
+        self.terrain_batch_key = None;
     }
 
     fn write_camera_uniform(&self) {
@@ -586,6 +812,18 @@ impl VoxelRenderer {
                     rect.width,
                     rect.height,
                     rect.color,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                ),
+                UiOverlayItem::Texture(rect) => push_overlay_textured_rect(
+                    &mut vertices,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    rect.color,
+                    rect.uvs,
+                    self.block_atlas.available,
                     self.config.width as f32,
                     self.config.height as f32,
                 ),
@@ -666,6 +904,7 @@ impl VoxelRenderer {
             uploaded_chunk_meshes: self.chunk_meshes.len(),
             ..RenderFrameStats::default()
         };
+        self.rebuild_terrain_batch_if_needed(aspect);
 
         {
             let color_attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -694,31 +933,38 @@ impl VoxelRenderer {
                 multiview_mask: None,
             });
 
-            if !self.chunk_meshes.is_empty() {
+            if let (Some(vertex_buffer), Some(index_buffer)) = (
+                self.terrain_batch.vertex_buffer.as_ref(),
+                self.terrain_batch.index_buffer.as_ref(),
+            ) {
                 render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.block_atlas.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..self.terrain_batch.index_count, 0, 0..1);
 
-                for mesh in &self.chunk_meshes {
-                    if frustum
-                        .as_ref()
-                        .is_some_and(|frustum| !frustum.intersects_aabb(mesh.bounds))
-                    {
-                        stats.culled_chunk_meshes += 1;
-                        continue;
-                    }
+                stats.drawn_chunk_meshes = self.terrain_batch.chunk_count;
+                stats.culled_chunk_meshes = self
+                    .chunk_meshes
+                    .len()
+                    .saturating_sub(self.terrain_batch.chunk_count);
+                stats.drawn_indices = self.terrain_batch.index_count;
+                stats.terrain_draw_calls = 1;
+            } else if frustum.is_some() {
+                stats.culled_chunk_meshes = self.chunk_meshes.len();
+            }
 
-                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    render_pass
-                        .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-
-                    stats.drawn_chunk_meshes += 1;
-                    stats.drawn_indices += mesh.index_count;
-                }
+            if let Some(vertex_buffer) = self.outline_vertex_buffer.as_ref() {
+                render_pass.set_pipeline(&self.outline_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.draw(0..self.outline_vertex_count, 0..1);
             }
 
             if let Some(vertex_buffer) = self.overlay_vertex_buffer.as_ref() {
                 render_pass.set_pipeline(&self.overlay_pipeline);
+                render_pass.set_bind_group(0, &self.block_atlas.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..self.overlay_vertex_count, 0..1);
             }
@@ -730,6 +976,29 @@ impl VoxelRenderer {
 
         RenderFrameStatus::Rendered
     }
+
+    fn rebuild_terrain_batch_if_needed(&mut self, aspect: f32) {
+        let key = TerrainBatchKey::from_camera(
+            self.camera,
+            self.config.width,
+            self.config.height,
+            self.chunk_mesh_revision,
+            self.frustum_culling_enabled,
+        );
+
+        if self.terrain_batch_key == Some(key) {
+            return;
+        }
+
+        self.terrain_batch.rebuild(
+            &self.device,
+            self.camera,
+            aspect,
+            self.frustum_culling_enabled,
+            &self.chunk_meshes,
+        );
+        self.terrain_batch_key = Some(key);
+    }
 }
 
 pub type ClearRenderer = VoxelRenderer;
@@ -739,13 +1008,29 @@ pub type ClearRenderer = VoxelRenderer;
 struct OverlayVertex {
     position: [f32; 2],
     color: [f32; 4],
+    uv: [f32; 2],
+    texture_weight: f32,
 }
 
 impl OverlayVertex {
     fn new(x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) -> Self {
+        Self::with_uv(x, y, width, height, color, [0.0, 0.0], 0.0)
+    }
+
+    fn with_uv(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: [f32; 4],
+        uv: [f32; 2],
+        texture_weight: f32,
+    ) -> Self {
         Self {
             position: [(x / width) * 2.0 - 1.0, 1.0 - (y / height) * 2.0],
             color,
+            uv,
+            texture_weight,
         }
     }
 
@@ -764,7 +1049,134 @@ impl OverlayVertex {
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                wgpu::VertexAttribute {
+                    offset: (std::mem::size_of::<[f32; 2]>() + std::mem::size_of::<[f32; 4]>())
+                        as wgpu::BufferAddress,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: (std::mem::size_of::<[f32; 2]>()
+                        + std::mem::size_of::<[f32; 4]>()
+                        + std::mem::size_of::<[f32; 2]>())
+                        as wgpu::BufferAddress,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32,
+                },
             ],
+        }
+    }
+}
+
+#[derive(Default)]
+struct TerrainBatch {
+    vertex_buffer: Option<wgpu::Buffer>,
+    index_buffer: Option<wgpu::Buffer>,
+    index_count: u32,
+    chunk_count: usize,
+}
+
+impl TerrainBatch {
+    fn rebuild(
+        &mut self,
+        device: &wgpu::Device,
+        camera: VoxelCamera,
+        aspect: f32,
+        frustum_culling_enabled: bool,
+        meshes: &[GpuChunkMesh],
+    ) {
+        if meshes.is_empty() {
+            self.clear();
+            return;
+        }
+
+        let visible = visible_mesh_indices(camera, aspect, frustum_culling_enabled, meshes);
+
+        if visible.is_empty() {
+            self.clear();
+            return;
+        }
+
+        let visible_count = visible.len();
+        let total_vertices = visible
+            .iter()
+            .map(|index| meshes[*index].vertices.len())
+            .sum();
+        let total_indices = visible
+            .iter()
+            .map(|index| meshes[*index].indices.len())
+            .sum();
+        let mut vertices = Vec::with_capacity(total_vertices);
+        let mut indices = Vec::with_capacity(total_indices);
+
+        for index in visible {
+            let mesh = &meshes[index];
+            let vertex_offset = vertices.len() as u32;
+
+            vertices.extend_from_slice(&mesh.vertices);
+            indices.extend(mesh.indices.iter().map(|index| index + vertex_offset));
+        }
+
+        self.vertex_buffer = Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Adventure Quest Terrain Batch Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+        );
+        self.index_buffer = Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Adventure Quest Terrain Batch Index Buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+        );
+        self.index_count = indices.len() as u32;
+        self.chunk_count = visible_count;
+    }
+
+    fn clear(&mut self) {
+        self.vertex_buffer = None;
+        self.index_buffer = None;
+        self.index_count = 0;
+        self.chunk_count = 0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerrainBatchKey {
+    position_bucket: [i32; 3],
+    yaw_bucket: i32,
+    pitch_bucket: i32,
+    width: u32,
+    height: u32,
+    mesh_revision: u64,
+    frustum_culling_enabled: bool,
+}
+
+impl TerrainBatchKey {
+    fn from_camera(
+        camera: VoxelCamera,
+        width: u32,
+        height: u32,
+        mesh_revision: u64,
+        frustum_culling_enabled: bool,
+    ) -> Self {
+        const ANGLE_BUCKET_RADIANS: f32 = 2.0_f32.to_radians();
+        let position_bucket_size = CHUNK_SIZE as f32 * 0.5;
+
+        Self {
+            position_bucket: [
+                (camera.position[0] / position_bucket_size).floor() as i32,
+                (camera.position[1] / position_bucket_size).floor() as i32,
+                (camera.position[2] / position_bucket_size).floor() as i32,
+            ],
+            yaw_bucket: (camera.yaw_radians / ANGLE_BUCKET_RADIANS).round() as i32,
+            pitch_bucket: (camera.pitch_radians / ANGLE_BUCKET_RADIANS).round() as i32,
+            width,
+            height,
+            mesh_revision,
+            frustum_culling_enabled,
         }
     }
 }
@@ -774,41 +1186,41 @@ struct GpuChunkMesh {
     revision: u32,
     bounds: Aabb,
     visible_mask: u8,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+    vertices: Box<[GpuVertex]>,
+    indices: Box<[u32]>,
     index_count: u32,
 }
 
 impl GpuChunkMesh {
-    fn from_upload(device: &wgpu::Device, upload: ChunkMeshUpload<'_>) -> Option<Self> {
+    fn from_upload(
+        _device: &wgpu::Device,
+        upload: ChunkMeshUpload<'_>,
+        texture_atlas_available: bool,
+    ) -> Option<Self> {
         if upload.mesh.vertices.is_empty() || upload.mesh.indices.is_empty() {
             return None;
         }
 
-        let vertices: Vec<GpuVertex> = upload
-            .mesh
-            .vertices
-            .iter()
-            .map(GpuVertex::from_mesh_vertex)
-            .collect();
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Adventure Quest Chunk Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Adventure Quest Chunk Index Buffer"),
-            contents: bytemuck::cast_slice(&upload.mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let mut vertices = Vec::with_capacity(upload.mesh.vertices.len());
+        let mut cached_block_id = None;
+        let mut cached_appearance = GpuBlockAppearance::from_block(0, texture_atlas_available);
 
+        for vertex in &upload.mesh.vertices {
+            if cached_block_id != Some(vertex.block_id) {
+                cached_block_id = Some(vertex.block_id);
+                cached_appearance =
+                    GpuBlockAppearance::from_block(vertex.block_id, texture_atlas_available);
+            }
+
+            vertices.push(GpuVertex::from_mesh_vertex(vertex, cached_appearance));
+        }
         Some(Self {
             coord: upload.coord,
             revision: upload.revision,
-            bounds: chunk_bounds(upload.coord),
+            bounds: chunk_visible_bounds(upload.coord, upload.visible_mask),
             visible_mask: upload.visible_mask,
-            vertex_buffer,
-            index_buffer,
+            vertices: vertices.into_boxed_slice(),
+            indices: upload.mesh.indices.clone().into_boxed_slice(),
             index_count: upload.mesh.indices.len() as u32,
         })
     }
@@ -824,6 +1236,238 @@ impl GpuChunkMesh {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CameraDepth {
+    position: Vec3,
+    forward: Vec3,
+}
+
+impl CameraDepth {
+    fn depth_to_bounds(self, bounds: Aabb) -> f32 {
+        self.depth_to_point(bounds.center())
+    }
+
+    fn near_depth_to_bounds(self, bounds: Aabb) -> f32 {
+        aabb_corners(bounds)
+            .into_iter()
+            .map(|corner| self.depth_to_point(corner))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    fn depth_to_point(self, point: [f32; 3]) -> f32 {
+        let to_point = Vec3::from_array(point) - self.position;
+
+        to_point.dot(self.forward)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MeshVisibilityCandidate {
+    index: usize,
+    depth: f32,
+    near_depth: f32,
+    rect: Option<ScreenRect>,
+}
+
+fn visible_mesh_indices(
+    camera: VoxelCamera,
+    aspect: f32,
+    frustum_culling_enabled: bool,
+    meshes: &[GpuChunkMesh],
+) -> Vec<usize> {
+    let frustum = frustum_culling_enabled.then(|| CameraFrustum::from_camera(camera, aspect));
+    let depth = camera.depth_sorter();
+    let view_projection = camera.view_projection(aspect);
+    let mut candidates = Vec::with_capacity(meshes.len());
+
+    for (index, mesh) in meshes.iter().enumerate() {
+        if frustum
+            .as_ref()
+            .is_some_and(|frustum| !frustum.intersects_aabb(mesh.bounds))
+        {
+            continue;
+        }
+
+        let near_depth = depth.near_depth_to_bounds(mesh.bounds);
+
+        if near_depth > camera.far || near_depth < -(CHUNK_SIZE as f32) {
+            continue;
+        }
+
+        candidates.push(MeshVisibilityCandidate {
+            index,
+            depth: depth.depth_to_bounds(mesh.bounds),
+            near_depth,
+            rect: project_aabb_to_screen_rect(view_projection, mesh.bounds),
+        });
+    }
+
+    candidates.sort_unstable_by(|left, right| {
+        left.depth.total_cmp(&right.depth).then_with(|| {
+            meshes[left.index]
+                .index_count
+                .cmp(&meshes[right.index].index_count)
+        })
+    });
+
+    let mut occlusion = ScreenOcclusionBuffer::default();
+    let mut visible = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        let Some(rect) = candidate.rect else {
+            visible.push(candidate.index);
+            continue;
+        };
+
+        if occlusion.is_occluded(rect, candidate.near_depth) {
+            continue;
+        }
+
+        occlusion.write(rect, candidate.near_depth);
+        visible.push(candidate.index);
+    }
+
+    visible
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScreenRect {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
+
+impl ScreenRect {
+    fn inset(self, amount: f32) -> Option<Self> {
+        let min_x = (self.min_x + amount).min(self.max_x);
+        let min_y = (self.min_y + amount).min(self.max_y);
+        let max_x = (self.max_x - amount).max(self.min_x);
+        let max_y = (self.max_y - amount).max(self.min_y);
+
+        (max_x > min_x && max_y > min_y).then_some(Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ScreenOcclusionBuffer {
+    depths: [f32; SCREEN_OCCLUSION_CELL_COUNT],
+}
+
+const SCREEN_OCCLUSION_WIDTH: usize = 96;
+const SCREEN_OCCLUSION_HEIGHT: usize = 54;
+const SCREEN_OCCLUSION_CELL_COUNT: usize = SCREEN_OCCLUSION_WIDTH * SCREEN_OCCLUSION_HEIGHT;
+const SCREEN_OCCLUSION_DEPTH_BIAS: f32 = CHUNK_SIZE as f32 * 0.5;
+
+impl Default for ScreenOcclusionBuffer {
+    fn default() -> Self {
+        Self {
+            depths: [f32::INFINITY; SCREEN_OCCLUSION_CELL_COUNT],
+        }
+    }
+}
+
+impl ScreenOcclusionBuffer {
+    fn is_occluded(&self, rect: ScreenRect, depth: f32) -> bool {
+        let Some(rect) = rect.inset(0.003) else {
+            return false;
+        };
+        let Some((x_range, y_range)) = screen_rect_cell_ranges(rect) else {
+            return false;
+        };
+        let occlusion_depth = depth - SCREEN_OCCLUSION_DEPTH_BIAS;
+
+        for y in y_range.clone() {
+            for x in x_range.clone() {
+                if self.depths[x + y * SCREEN_OCCLUSION_WIDTH] > occlusion_depth {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn write(&mut self, rect: ScreenRect, depth: f32) {
+        let Some(rect) = rect.inset(0.01) else {
+            return;
+        };
+        let Some((x_range, y_range)) = screen_rect_cell_ranges(rect) else {
+            return;
+        };
+
+        for y in y_range {
+            for x in x_range.clone() {
+                let index = x + y * SCREEN_OCCLUSION_WIDTH;
+                self.depths[index] = self.depths[index].min(depth);
+            }
+        }
+    }
+}
+
+fn screen_rect_cell_ranges(
+    rect: ScreenRect,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let min_x = (rect.min_x.clamp(0.0, 1.0) * SCREEN_OCCLUSION_WIDTH as f32).floor() as usize;
+    let min_y = (rect.min_y.clamp(0.0, 1.0) * SCREEN_OCCLUSION_HEIGHT as f32).floor() as usize;
+    let max_x = (rect.max_x.clamp(0.0, 1.0) * SCREEN_OCCLUSION_WIDTH as f32).ceil() as usize;
+    let max_y = (rect.max_y.clamp(0.0, 1.0) * SCREEN_OCCLUSION_HEIGHT as f32).ceil() as usize;
+    let max_x = max_x.min(SCREEN_OCCLUSION_WIDTH);
+    let max_y = max_y.min(SCREEN_OCCLUSION_HEIGHT);
+
+    (max_x > min_x && max_y > min_y).then_some((min_x..max_x, min_y..max_y))
+}
+
+fn project_aabb_to_screen_rect(view_projection: Mat4, bounds: Aabb) -> Option<ScreenRect> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for corner in aabb_corners(bounds) {
+        let clip = view_projection * Vec3::from_array(corner).extend(1.0);
+
+        if clip.w <= 0.0 {
+            return None;
+        }
+
+        let ndc = clip.truncate() / clip.w;
+        min_x = min_x.min(ndc.x);
+        min_y = min_y.min(ndc.y);
+        max_x = max_x.max(ndc.x);
+        max_y = max_y.max(ndc.y);
+    }
+
+    if max_x < -1.0 || min_x > 1.0 || max_y < -1.0 || min_y > 1.0 {
+        return None;
+    }
+
+    Some(ScreenRect {
+        min_x: (min_x.max(-1.0) + 1.0) * 0.5,
+        min_y: (1.0 - max_y.min(1.0)) * 0.5,
+        max_x: (max_x.min(1.0) + 1.0) * 0.5,
+        max_y: (1.0 - min_y.max(-1.0)) * 0.5,
+    })
+}
+
+fn aabb_corners(bounds: Aabb) -> [[f32; 3]; 8] {
+    [
+        [bounds.min[0], bounds.min[1], bounds.min[2]],
+        [bounds.max[0], bounds.min[1], bounds.min[2]],
+        [bounds.min[0], bounds.max[1], bounds.min[2]],
+        [bounds.max[0], bounds.max[1], bounds.min[2]],
+        [bounds.min[0], bounds.min[1], bounds.max[2]],
+        [bounds.max[0], bounds.min[1], bounds.max[2]],
+        [bounds.min[0], bounds.max[1], bounds.max[2]],
+        [bounds.max[0], bounds.max[1], bounds.max[2]],
+    ]
+}
+
 fn chunk_bounds(coord: ChunkCoord) -> Aabb {
     let size = CHUNK_SIZE as f32;
     let min = [
@@ -834,6 +1478,68 @@ fn chunk_bounds(coord: ChunkCoord) -> Aabb {
     let max = [min[0] + size, min[1] + size, min[2] + size];
 
     Aabb::new(min, max)
+}
+
+fn chunk_visible_bounds(coord: ChunkCoord, visible_mask: u8) -> Aabb {
+    if visible_mask == 0 {
+        return chunk_bounds(coord);
+    }
+
+    let chunk_min = [
+        coord.x as f32 * CHUNK_SIZE as f32,
+        coord.y as f32 * CHUNK_SIZE as f32,
+        coord.z as f32 * CHUNK_SIZE as f32,
+    ];
+    let subchunk_size = CHUNK_SIZE as f32 * 0.5;
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+
+    for subchunk in 0..8 {
+        if visible_mask & (1u8 << subchunk) == 0 {
+            continue;
+        }
+
+        let sx = (subchunk & 1) as f32;
+        let sy = ((subchunk >> 1) & 1) as f32;
+        let sz = ((subchunk >> 2) & 1) as f32;
+        let sub_min = [
+            chunk_min[0] + sx * subchunk_size,
+            chunk_min[1] + sy * subchunk_size,
+            chunk_min[2] + sz * subchunk_size,
+        ];
+        let sub_max = [
+            sub_min[0] + subchunk_size,
+            sub_min[1] + subchunk_size,
+            sub_min[2] + subchunk_size,
+        ];
+
+        for axis in 0..3 {
+            min[axis] = min[axis].min(sub_min[axis]);
+            max[axis] = max[axis].max(sub_max[axis]);
+        }
+    }
+
+    Aabb::new(min, max)
+}
+
+fn chunk_center(coord: ChunkCoord) -> [f32; 3] {
+    let bounds = chunk_bounds(coord);
+
+    bounds.center()
+}
+
+trait AabbCenter {
+    fn center(self) -> [f32; 3];
+}
+
+impl AabbCenter for Aabb {
+    fn center(self) -> [f32; 3] {
+        [
+            (self.min[0] + self.max[0]) * 0.5,
+            (self.min[1] + self.max[1]) * 0.5,
+            (self.min[2] + self.max[2]) * 0.5,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -933,17 +1639,96 @@ fn aabb_positive_vertex(bounds: Aabb, normal: Vec3) -> Vec3 {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuVertex {
     position: [f32; 3],
-    normal: [f32; 3],
-    color: [f32; 3],
+    uv: [f32; 2],
+    color: [u8; 4],
+    normal: [i8; 4],
+    texture_weight: f32,
 }
 
 impl GpuVertex {
-    fn from_mesh_vertex(vertex: &meshing::Vertex) -> Self {
+    fn from_mesh_vertex(vertex: &meshing::Vertex, appearance: GpuBlockAppearance) -> Self {
         Self {
             position: vertex.position,
-            normal: vertex.normal,
-            color: block_color(vertex.block_id),
+            uv: vertex.uv,
+            color: appearance.color,
+            normal: pack_snorm4(vertex.normal),
+            texture_weight: appearance.texture_weight,
         }
+    }
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        const UV_OFFSET: wgpu::BufferAddress =
+            std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress;
+        const COLOR_OFFSET: wgpu::BufferAddress =
+            UV_OFFSET + std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress;
+        const NORMAL_OFFSET: wgpu::BufferAddress =
+            COLOR_OFFSET + std::mem::size_of::<[u8; 4]>() as wgpu::BufferAddress;
+        const TEXTURE_WEIGHT_OFFSET: wgpu::BufferAddress =
+            NORMAL_OFFSET + std::mem::size_of::<[i8; 4]>() as wgpu::BufferAddress;
+
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: UV_OFFSET,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: COLOR_OFFSET,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Unorm8x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: NORMAL_OFFSET,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Snorm8x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: TEXTURE_WEIGHT_OFFSET,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32,
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GpuBlockAppearance {
+    color: [u8; 4],
+    texture_weight: f32,
+}
+
+impl GpuBlockAppearance {
+    fn from_block(block_id: u16, texture_atlas_available: bool) -> Self {
+        Self {
+            color: pack_unorm4(block_color(block_id)),
+            texture_weight: if texture_atlas_available && voxels::block_has_texture(block_id) {
+                1.0
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct OutlineVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+impl OutlineVertex {
+    const fn new(position: [f32; 3], color: [f32; 4]) -> Self {
+        Self { position, color }
     }
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -959,16 +1744,55 @@ impl GpuVertex {
                 wgpu::VertexAttribute {
                     offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: (std::mem::size_of::<[f32; 3]>() * 2) as wgpu::BufferAddress,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Float32x4,
                 },
             ],
         }
     }
+}
+
+fn block_outline_vertices(block: BlockPos) -> Vec<OutlineVertex> {
+    const COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.96];
+    const EXPAND: f32 = 0.002;
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 3),
+        (3, 2),
+        (2, 0),
+        (4, 5),
+        (5, 7),
+        (7, 6),
+        (6, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+
+    let min_x = block.x as f32 - EXPAND;
+    let min_y = block.y as f32 - EXPAND;
+    let min_z = block.z as f32 - EXPAND;
+    let max_x = block.x as f32 + 1.0 + EXPAND;
+    let max_y = block.y as f32 + 1.0 + EXPAND;
+    let max_z = block.z as f32 + 1.0 + EXPAND;
+    let corners = [
+        [min_x, min_y, min_z],
+        [max_x, min_y, min_z],
+        [min_x, max_y, min_z],
+        [max_x, max_y, min_z],
+        [min_x, min_y, max_z],
+        [max_x, min_y, max_z],
+        [min_x, max_y, max_z],
+        [max_x, max_y, max_z],
+    ];
+    let mut vertices = Vec::with_capacity(EDGES.len() * 2);
+
+    for (start, end) in EDGES {
+        vertices.push(OutlineVertex::new(corners[start], COLOR));
+        vertices.push(OutlineVertex::new(corners[end], COLOR));
+    }
+
+    vertices
 }
 
 #[repr(C)]
@@ -1015,15 +1839,137 @@ impl DepthTexture {
     }
 }
 
-fn block_color(block_id: u16) -> [f32; 3] {
-    match block_id {
-        1 => [0.45, 0.27, 0.13],
-        2 => [0.18, 0.58, 0.18],
-        3 => [0.48, 0.48, 0.50],
-        4 => [0.12, 0.12, 0.12],
-        5 => [0.72, 0.48, 0.32],
-        _ => [0.95, 0.1, 0.85],
+struct BlockTextureAtlas {
+    bind_group: wgpu::BindGroup,
+    available: bool,
+}
+
+impl BlockTextureAtlas {
+    fn load_or_fallback(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let texture_data = load_block_texture_atlas().unwrap_or_else(|| TextureData {
+            pixels: vec![0, 0, 0, 0],
+            width: 1,
+            height: 1,
+            available: false,
+        });
+        let size = wgpu::Extent3d {
+            width: texture_data.width.max(1),
+            height: texture_data.height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Adventure Quest Block Texture Atlas"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &texture_data.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * size.width),
+                rows_per_image: Some(size.height),
+            },
+            size,
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Adventure Quest Block Texture Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Adventure Quest Block Texture Bind Group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        Self {
+            bind_group,
+            available: texture_data.available,
+        }
     }
+}
+
+struct TextureData {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    available: bool,
+}
+
+fn load_block_texture_atlas() -> Option<TextureData> {
+    let path = Path::new(voxels::BLOCK_TEXTURE_ATLAS_PATH);
+
+    if !path.exists() {
+        return None;
+    }
+
+    let image = image::open(path).ok()?.to_rgba8();
+    let width = image.width();
+    let height = image.height();
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some(TextureData {
+        pixels: image.into_raw(),
+        width,
+        height,
+        available: true,
+    })
+}
+
+fn block_color(block_id: u16) -> [f32; 4] {
+    voxels::block_color_rgba(block_id)
+}
+
+fn pack_unorm4(color: [f32; 4]) -> [u8; 4] {
+    color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn pack_snorm4(normal: [f32; 3]) -> [i8; 4] {
+    [
+        pack_snorm(normal[0]),
+        pack_snorm(normal[1]),
+        pack_snorm(normal[2]),
+        0,
+    ]
+}
+
+fn pack_snorm(value: f32) -> i8 {
+    (value.clamp(-1.0, 1.0) * 127.0).round() as i8
 }
 
 fn build_text_vertices(text: &str, width: u32, height: u32) -> Vec<OverlayVertex> {
@@ -1190,6 +2136,37 @@ fn push_overlay_rect(
     ]);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_overlay_textured_rect(
+    vertices: &mut Vec<OverlayVertex>,
+    x: f32,
+    y: f32,
+    rect_width: f32,
+    rect_height: f32,
+    color: [f32; 4],
+    uvs: [[f32; 2]; 4],
+    texture_atlas_available: bool,
+    width: f32,
+    height: f32,
+) {
+    if width <= 0.0 || height <= 0.0 || rect_width <= 0.0 || rect_height <= 0.0 {
+        return;
+    }
+
+    let x1 = x + rect_width;
+    let y1 = y + rect_height;
+    let texture_weight = if texture_atlas_available { 1.0 } else { 0.0 };
+
+    vertices.extend_from_slice(&[
+        OverlayVertex::with_uv(x, y, width, height, color, uvs[0], texture_weight),
+        OverlayVertex::with_uv(x1, y, width, height, color, uvs[1], texture_weight),
+        OverlayVertex::with_uv(x1, y1, width, height, color, uvs[2], texture_weight),
+        OverlayVertex::with_uv(x, y, width, height, color, uvs[0], texture_weight),
+        OverlayVertex::with_uv(x1, y1, width, height, color, uvs[2], texture_weight),
+        OverlayVertex::with_uv(x, y1, width, height, color, uvs[3], texture_weight),
+    ]);
+}
+
 fn glyph_pattern(character: char) -> Option<[&'static str; 7]> {
     match character {
         'A' => Some([
@@ -1315,16 +2292,26 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 
+@group(1) @binding(0)
+var block_texture: texture_2d<f32>;
+
+@group(1) @binding(1)
+var block_sampler: sampler;
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) color: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) normal: vec4<f32>,
+    @location(4) texture_weight: f32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec3<f32>,
+    @location(0) color: vec4<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) texture_weight: f32,
 };
 
 @vertex
@@ -1332,7 +2319,9 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     output.color = input.color;
-    output.normal = input.normal;
+    output.normal = input.normal.xyz;
+    output.uv = input.uv;
+    output.texture_weight = input.texture_weight;
     return output;
 }
 
@@ -1341,14 +2330,24 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.45, 0.85, 0.25));
     let directional = max(dot(normalize(input.normal), light_dir), 0.0);
     let lighting = 0.38 + directional * 0.62;
+    let texture_color = textureSample(block_texture, block_sampler, input.uv);
+    let texture_mix = clamp(input.texture_weight * texture_color.a, 0.0, 1.0);
+    let base_color = mix(input.color.rgb, texture_color.rgb, texture_mix);
 
-    return vec4<f32>(input.color * lighting, 1.0);
+    return vec4<f32>(base_color * lighting, input.color.a);
 }
 "#;
 
-const OVERLAY_SHADER: &str = r#"
+const OUTLINE_SHADER: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
 struct VertexInput {
-    @location(0) position: vec2<f32>,
+    @location(0) position: vec3<f32>,
     @location(1) color: vec4<f32>,
 };
 
@@ -1360,7 +2359,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.clip_position = vec4<f32>(input.position, 0.0, 1.0);
+    output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     output.color = input.color;
     return output;
 }
@@ -1368,6 +2367,47 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return input.color;
+}
+"#;
+
+const OVERLAY_SHADER: &str = r#"
+@group(0) @binding(0)
+var block_texture: texture_2d<f32>;
+
+@group(0) @binding(1)
+var block_sampler: sampler;
+
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) texture_weight: f32,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) texture_weight: f32,
+};
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.clip_position = vec4<f32>(input.position, 0.0, 1.0);
+    output.color = input.color;
+    output.uv = input.uv;
+    output.texture_weight = input.texture_weight;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texture_color = textureSample(block_texture, block_sampler, input.uv);
+    let texture_mix = clamp(input.texture_weight * texture_color.a, 0.0, 1.0);
+    let color = mix(input.color, texture_color, texture_mix);
+
+    return vec4<f32>(color.rgb, max(input.color.a, color.a));
 }
 "#;
 
@@ -1401,6 +2441,48 @@ mod tests {
     }
 
     #[test]
+    fn chunk_visible_bounds_follow_visible_subchunk_mask() {
+        let bounds = chunk_visible_bounds(ChunkCoord::new(0, 0, 0), 0b1000_0000);
+
+        assert_eq!(bounds.min, [16.0, 16.0, 16.0]);
+        assert_eq!(bounds.max, [32.0, 32.0, 32.0]);
+    }
+
+    #[test]
+    fn screen_occlusion_buffer_culls_covered_far_rects() {
+        let rect = ScreenRect {
+            min_x: 0.3,
+            min_y: 0.3,
+            max_x: 0.7,
+            max_y: 0.7,
+        };
+        let mut occlusion = ScreenOcclusionBuffer::default();
+
+        assert!(!occlusion.is_occluded(rect, 128.0));
+
+        occlusion.write(rect, 32.0);
+
+        assert!(occlusion.is_occluded(rect, 128.0));
+        assert!(!occlusion.is_occluded(rect, 40.0));
+    }
+
+    #[test]
+    fn visible_mesh_indices_skip_chunks_covered_by_nearer_chunks() {
+        let mut camera = VoxelCamera::new([0.0, 16.0, 16.0], 0.0, 0.0);
+        camera.fov_y_radians = 90.0_f32.to_radians();
+        camera.far = 256.0;
+        let meshes = vec![
+            test_gpu_chunk_mesh(ChunkCoord::new(1, 0, 0), 0b1111_1111),
+            test_gpu_chunk_mesh(ChunkCoord::new(4, 0, 0), 0b1111_1111),
+        ];
+
+        let visible = visible_mesh_indices(camera, 16.0 / 9.0, true, &meshes);
+
+        assert!(visible.contains(&0));
+        assert!(!visible.contains(&1));
+    }
+
+    #[test]
     fn camera_frustum_accepts_visible_chunk_bounds() {
         let mut camera = VoxelCamera::new([0.0, 0.0, 0.0], 0.0, 0.0);
         camera.fov_y_radians = 90.0_f32.to_radians();
@@ -1427,6 +2509,18 @@ mod tests {
     }
 
     #[test]
+    fn camera_chunk_depth_increases_along_forward_axis() {
+        let camera = VoxelCamera::new([16.0, 16.0, 16.0], 0.0, 0.0);
+
+        assert!(camera.chunk_depth(ChunkCoord::new(1, 0, 0)) > 0.0);
+        assert!(
+            camera.chunk_depth(ChunkCoord::new(5, 0, 0))
+                > camera.chunk_depth(ChunkCoord::new(1, 0, 0))
+        );
+        assert!(camera.chunk_depth(ChunkCoord::new(-2, 0, 0)) < 0.0);
+    }
+
+    #[test]
     fn crosshair_builds_four_overlay_rectangles() {
         let mut vertices = Vec::new();
 
@@ -1446,6 +2540,33 @@ mod tests {
     }
 
     #[test]
+    fn block_outline_builds_cube_edges_without_diagonals() {
+        let vertices = block_outline_vertices(BlockPos::new(3, 4, 5));
+
+        assert_eq!(vertices.len(), 24);
+
+        for edge in vertices.chunks_exact(2) {
+            let start = edge[0].position;
+            let end = edge[1].position;
+            let changed_axes = [
+                (start[0] - end[0]).abs() > f32::EPSILON,
+                (start[1] - end[1]).abs() > f32::EPSILON,
+                (start[2] - end[2]).abs() > f32::EPSILON,
+            ]
+            .into_iter()
+            .filter(|changed| *changed)
+            .count();
+
+            assert_eq!(changed_axes, 1);
+        }
+    }
+
+    #[test]
+    fn gpu_chunk_vertex_uses_compact_layout() {
+        assert_eq!(std::mem::size_of::<GpuVertex>(), 32);
+    }
+
+    #[test]
     fn renderer_options_select_expected_present_mode() {
         assert_eq!(
             RendererOptions::default().present_mode(),
@@ -1455,5 +2576,24 @@ mod tests {
             RendererOptions::new(false).present_mode(),
             wgpu::PresentMode::AutoNoVsync
         );
+    }
+
+    fn test_gpu_chunk_mesh(coord: ChunkCoord, visible_mask: u8) -> GpuChunkMesh {
+        GpuChunkMesh {
+            coord,
+            revision: 0,
+            bounds: chunk_visible_bounds(coord, visible_mask),
+            visible_mask,
+            vertices: vec![GpuVertex {
+                position: [0.0; 3],
+                uv: [0.0; 2],
+                color: [255; 4],
+                normal: [0, 0, 127, 0],
+                texture_weight: 0.0,
+            }]
+            .into_boxed_slice(),
+            indices: vec![0].into_boxed_slice(),
+            index_count: 1,
+        }
     }
 }

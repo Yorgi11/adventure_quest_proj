@@ -1,0 +1,1 @@
+pub const UNARMED_BREAK_DAMAGE_PER_SECOND: f32 = 1.0;

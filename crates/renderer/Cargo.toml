@@ -9,6 +9,7 @@ license.workspace = true
 bytemuck.workspace = true
 foundation.workspace = true
 glam.workspace = true
+image.workspace = true
 meshing.workspace = true
 voxels.workspace = true
 wgpu.workspace = true

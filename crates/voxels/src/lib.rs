@@ -1,5 +1,14 @@
 use foundation::ChunkCoord;
 
+pub mod block_config;
+
+pub use block_config::{
+    block_break_hp, block_color_rgb, block_color_rgba, block_face_uv, block_has_hotbar_texture,
+    block_has_texture, block_hotbar_texture, block_hotbar_uvs, block_is_opaque, block_label,
+    block_properties, block_texture, texture_face_uvs, texture_region_uvs, BlockProperties,
+    BlockTextureRegion, CubeFace, TextureBounds, BLOCK_TEXTURE_ATLAS_PATH,
+};
+
 pub type BlockId = u16;
 
 pub const AIR_BLOCK: BlockId = 0;

@@ -1,6 +1,8 @@
 use foundation::BlockPos;
 use physics::{raycast_blocks, VoxelRayHit};
-use voxels::{BlockId, AIR_BLOCK, DIRT_BLOCK, GRASS_BLOCK, STONE_BLOCK};
+use voxels::{
+    BlockId, AIR_BLOCK, COAL_ORE_BLOCK, DIRT_BLOCK, GRASS_BLOCK, IRON_ORE_BLOCK, STONE_BLOCK,
+};
 use world::{BlockEdit, BlockEditSummary, VoxelWorld};
 
 pub const HOTBAR_SLOT_COUNT: usize = 9;
@@ -24,8 +26,8 @@ impl Hotbar {
             DIRT_BLOCK,
             GRASS_BLOCK,
             STONE_BLOCK,
-            AIR_BLOCK,
-            AIR_BLOCK,
+            COAL_ORE_BLOCK,
+            IRON_ORE_BLOCK,
             AIR_BLOCK,
             AIR_BLOCK,
             AIR_BLOCK,
@@ -93,6 +95,10 @@ pub fn break_target_block(
         return BlockInteraction::Miss;
     };
 
+    break_hit_block(world, hit)
+}
+
+pub fn break_hit_block(world: &mut VoxelWorld, hit: VoxelRayHit) -> BlockInteraction {
     let summary = world.set_blocks([BlockEdit::new(hit.world_block, AIR_BLOCK)]);
 
     BlockInteraction::Break { hit, summary }
@@ -164,8 +170,12 @@ mod tests {
         assert_eq!(hotbar.selected_block(), DIRT_BLOCK);
         assert!(hotbar.select_slot(2));
         assert_eq!(hotbar.selected_block(), STONE_BLOCK);
+        assert!(hotbar.select_slot(3));
+        assert_eq!(hotbar.selected_block(), COAL_ORE_BLOCK);
+        assert!(hotbar.select_slot(4));
+        assert_eq!(hotbar.selected_block(), IRON_ORE_BLOCK);
         assert!(hotbar.set_slot(2, GRASS_BLOCK));
-        assert_eq!(hotbar.selected_block(), GRASS_BLOCK);
+        assert_eq!(hotbar.slots()[2], GRASS_BLOCK);
         assert!(!hotbar.select_slot(HOTBAR_SLOT_COUNT));
         assert!(!hotbar.set_slot(HOTBAR_SLOT_COUNT, STONE_BLOCK));
     }
@@ -185,6 +195,25 @@ mod tests {
         assert_eq!(hit.world_block, BlockPos::new(3, 0, 0));
         assert_eq!(summary.changed_blocks, 1);
         assert_eq!(world.get_block(BlockPos::new(3, 0, 0)), AIR_BLOCK);
+    }
+
+    #[test]
+    fn break_hit_block_sets_hit_block_to_air() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = world_with_empty_chunk(coord);
+        let pos = BlockPos::new(3, 0, 0);
+        world.set_block(pos, STONE_BLOCK);
+        let hit = raycast_blocks(&world, [0.5, 0.5, 0.5], [1.0, 0.0, 0.0], 10.0)
+            .expect("ray should hit stone");
+
+        let result = break_hit_block(&mut world, hit);
+
+        let BlockInteraction::Break { summary, .. } = result else {
+            panic!("expected break interaction");
+        };
+
+        assert_eq!(summary.changed_blocks, 1);
+        assert_eq!(world.get_block(pos), AIR_BLOCK);
     }
 
     #[test]
@@ -231,7 +260,7 @@ mod tests {
         world.set_block(BlockPos::new(3, 0, 0), STONE_BLOCK);
 
         let mut hotbar = Hotbar::starter();
-        hotbar.select_slot(3);
+        hotbar.select_slot(5);
 
         let result =
             place_selected_block(&mut world, &hotbar, [0.5, 0.5, 0.5], [1.0, 0.0, 0.0], 10.0);
