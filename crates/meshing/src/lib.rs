@@ -1,8 +1,8 @@
 use foundation::{BlockPos, ChunkCoord};
 use std::ops::Range;
 use voxels::{
-    block_face_uv, block_is_opaque, subchunk_bit, subchunk_index, BlockId, Chunk, CubeFace,
-    AIR_BLOCK, CHUNK_SIZE, STONE_BLOCK, SUBCHUNK_COUNT, SUBCHUNK_SIZE,
+    block_face_uv, block_index, block_is_opaque, subchunk_bit, subchunk_index, BlockId, Chunk,
+    CubeFace, AIR_BLOCK, CHUNK_SIZE, CHUNK_VOLUME, STONE_BLOCK, SUBCHUNK_COUNT, SUBCHUNK_SIZE,
 };
 use world::VoxelWorld;
 
@@ -211,6 +211,8 @@ fn mesh_block_range(
     mesh: &mut MeshData,
     neighbor_block: impl Fn(&Chunk, ChunkCoord, usize, usize, usize, Direction) -> BlockId,
 ) {
+    let surface_air = surface_air_mask(chunk);
+
     for y in y_range {
         for z in z_range.clone() {
             for x in x_range.clone() {
@@ -228,7 +230,9 @@ fn mesh_block_range(
                 for dir in ALL_DIRECTIONS {
                     let neighbor = neighbor_block(chunk, coord, x, y, z, dir);
 
-                    if !block_is_opaque(neighbor) {
+                    if !block_is_opaque(neighbor)
+                        && face_touches_surface_air(&surface_air, x, y, z, dir)
+                    {
                         let subchunk = subchunk_index(x, y, z);
                         mesh.subchunk_visible_mask |= subchunk_bit(subchunk);
                         add_face(mesh, world_pos, dir, block);
@@ -236,6 +240,100 @@ fn mesh_block_range(
                 }
             }
         }
+    }
+}
+
+fn surface_air_mask(chunk: &Chunk) -> Vec<bool> {
+    let mut mask = vec![false; CHUNK_VOLUME];
+    let mut stack = Vec::with_capacity(CHUNK_AREA_ESTIMATE);
+
+    for z in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            push_surface_air(chunk, &mut mask, &mut stack, x, CHUNK_SIZE - 1, z);
+        }
+    }
+
+    while let Some(index) = stack.pop() {
+        let y = index / (CHUNK_SIZE * CHUNK_SIZE);
+        let rem = index - y * CHUNK_SIZE * CHUNK_SIZE;
+        let z = rem / CHUNK_SIZE;
+        let x = rem - z * CHUNK_SIZE;
+
+        if x > 0 {
+            push_surface_air(chunk, &mut mask, &mut stack, x - 1, y, z);
+        }
+        if x + 1 < CHUNK_SIZE {
+            push_surface_air(chunk, &mut mask, &mut stack, x + 1, y, z);
+        }
+        if y > 0 {
+            push_surface_air(chunk, &mut mask, &mut stack, x, y - 1, z);
+        }
+        if y + 1 < CHUNK_SIZE {
+            push_surface_air(chunk, &mut mask, &mut stack, x, y + 1, z);
+        }
+        if z > 0 {
+            push_surface_air(chunk, &mut mask, &mut stack, x, y, z - 1);
+        }
+        if z + 1 < CHUNK_SIZE {
+            push_surface_air(chunk, &mut mask, &mut stack, x, y, z + 1);
+        }
+    }
+
+    mask
+}
+
+const CHUNK_AREA_ESTIMATE: usize = CHUNK_SIZE * CHUNK_SIZE;
+
+fn push_surface_air(
+    chunk: &Chunk,
+    mask: &mut [bool],
+    stack: &mut Vec<usize>,
+    x: usize,
+    y: usize,
+    z: usize,
+) {
+    if block_is_opaque(chunk.get_block(x, y, z)) {
+        return;
+    }
+
+    let index = block_index(x, y, z);
+
+    if mask[index] {
+        return;
+    }
+
+    mask[index] = true;
+    stack.push(index);
+}
+
+fn face_touches_surface_air(
+    surface_air: &[bool],
+    x: usize,
+    y: usize,
+    z: usize,
+    direction: Direction,
+) -> bool {
+    let Some((air_x, air_y, air_z)) = local_neighbor_coords(x, y, z, direction) else {
+        return true;
+    };
+
+    surface_air[block_index(air_x, air_y, air_z)]
+}
+
+fn local_neighbor_coords(
+    x: usize,
+    y: usize,
+    z: usize,
+    direction: Direction,
+) -> Option<(usize, usize, usize)> {
+    match direction {
+        Direction::PosX if x + 1 < CHUNK_SIZE => Some((x + 1, y, z)),
+        Direction::NegX if x > 0 => Some((x - 1, y, z)),
+        Direction::PosY if y + 1 < CHUNK_SIZE => Some((x, y + 1, z)),
+        Direction::NegY if y > 0 => Some((x, y - 1, z)),
+        Direction::PosZ if z + 1 < CHUNK_SIZE => Some((x, y, z + 1)),
+        Direction::NegZ if z > 0 => Some((x, y, z - 1)),
+        _ => None,
     }
 }
 
@@ -589,6 +687,21 @@ mod tests {
         assert_eq!(neighbor_mesh.visible_face_count, 5);
         assert_eq!(origin_mesh.subchunk_visible_mask, subchunk_bit(7));
         assert_eq!(neighbor_mesh.subchunk_visible_mask, subchunk_bit(6));
+    }
+
+    #[test]
+    fn enclosed_cave_air_does_not_emit_surface_faces() {
+        let coord = ChunkCoord::new(0, 0, 0);
+        let mut world = VoxelWorld::new(0);
+        let mut chunk = Chunk::from_blocks(coord, Box::new([STONE_BLOCK; CHUNK_VOLUME]), 0);
+
+        chunk.set_block_raw(2, 2, 2, AIR_BLOCK);
+        world.chunks.insert(coord, chunk);
+
+        let mesh = mesh_chunk(&world, coord).expect("chunk exists");
+
+        assert_eq!(mesh.visible_face_count, 0);
+        assert!(!mesh.has_visible_geometry());
     }
 
     #[test]

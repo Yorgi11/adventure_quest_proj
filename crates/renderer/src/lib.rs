@@ -1265,8 +1265,7 @@ impl CameraDepth {
 struct MeshVisibilityCandidate {
     index: usize,
     depth: f32,
-    near_depth: f32,
-    rect: Option<ScreenRect>,
+    distance_key: i32,
 }
 
 fn visible_mesh_indices(
@@ -1277,182 +1276,72 @@ fn visible_mesh_indices(
 ) -> Vec<usize> {
     let frustum = frustum_culling_enabled.then(|| CameraFrustum::from_camera(camera, aspect));
     let depth = camera.depth_sorter();
-    let view_projection = camera.view_projection(aspect);
+    let center = camera_chunk_coord(camera);
     let mut candidates = Vec::with_capacity(meshes.len());
 
     for (index, mesh) in meshes.iter().enumerate() {
-        if frustum
-            .as_ref()
-            .is_some_and(|frustum| !frustum.intersects_aabb(mesh.bounds))
+        let distance_key = chunk_distance_key(center, mesh.coord);
+        let protected = chunk_is_protected_near_camera(center, mesh.coord);
+
+        if !protected
+            && frustum
+                .as_ref()
+                .is_some_and(|frustum| !frustum.intersects_aabb(mesh.bounds))
         {
             continue;
         }
 
         let near_depth = depth.near_depth_to_bounds(mesh.bounds);
 
-        if near_depth > camera.far || near_depth < -(CHUNK_SIZE as f32) {
+        if !protected && (near_depth > camera.far || near_depth < -(CHUNK_SIZE as f32)) {
             continue;
         }
 
         candidates.push(MeshVisibilityCandidate {
             index,
             depth: depth.depth_to_bounds(mesh.bounds),
-            near_depth,
-            rect: project_aabb_to_screen_rect(view_projection, mesh.bounds),
+            distance_key,
         });
     }
 
     candidates.sort_unstable_by(|left, right| {
-        left.depth.total_cmp(&right.depth).then_with(|| {
-            meshes[left.index]
-                .index_count
-                .cmp(&meshes[right.index].index_count)
-        })
+        left.distance_key
+            .cmp(&right.distance_key)
+            .then_with(|| left.depth.total_cmp(&right.depth))
+            .then_with(|| {
+                meshes[left.index]
+                    .index_count
+                    .cmp(&meshes[right.index].index_count)
+            })
     });
 
-    let mut occlusion = ScreenOcclusionBuffer::default();
-    let mut visible = Vec::with_capacity(candidates.len());
-
-    for candidate in candidates {
-        let Some(rect) = candidate.rect else {
-            visible.push(candidate.index);
-            continue;
-        };
-
-        if occlusion.is_occluded(rect, candidate.near_depth) {
-            continue;
-        }
-
-        occlusion.write(rect, candidate.near_depth);
-        visible.push(candidate.index);
-    }
-
-    visible
+    candidates
+        .into_iter()
+        .map(|candidate| candidate.index)
+        .collect()
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ScreenRect {
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
+const PROTECTED_NEAR_CAMERA_CHUNK_RADIUS: i32 = 2;
+
+fn chunk_is_protected_near_camera(center: ChunkCoord, coord: ChunkCoord) -> bool {
+    chunk_distance_key(center, coord)
+        <= PROTECTED_NEAR_CAMERA_CHUNK_RADIUS * PROTECTED_NEAR_CAMERA_CHUNK_RADIUS
 }
 
-impl ScreenRect {
-    fn inset(self, amount: f32) -> Option<Self> {
-        let min_x = (self.min_x + amount).min(self.max_x);
-        let min_y = (self.min_y + amount).min(self.max_y);
-        let max_x = (self.max_x - amount).max(self.min_x);
-        let max_y = (self.max_y - amount).max(self.min_y);
-
-        (max_x > min_x && max_y > min_y).then_some(Self {
-            min_x,
-            min_y,
-            max_x,
-            max_y,
-        })
-    }
+fn camera_chunk_coord(camera: VoxelCamera) -> ChunkCoord {
+    ChunkCoord::new(
+        (camera.position[0].floor() as i32).div_euclid(CHUNK_SIZE as i32),
+        (camera.position[1].floor() as i32).div_euclid(CHUNK_SIZE as i32),
+        (camera.position[2].floor() as i32).div_euclid(CHUNK_SIZE as i32),
+    )
 }
 
-#[derive(Debug)]
-struct ScreenOcclusionBuffer {
-    depths: [f32; SCREEN_OCCLUSION_CELL_COUNT],
-}
+fn chunk_distance_key(center: ChunkCoord, coord: ChunkCoord) -> i32 {
+    let dx = coord.x - center.x;
+    let dy = coord.y - center.y;
+    let dz = coord.z - center.z;
 
-const SCREEN_OCCLUSION_WIDTH: usize = 96;
-const SCREEN_OCCLUSION_HEIGHT: usize = 54;
-const SCREEN_OCCLUSION_CELL_COUNT: usize = SCREEN_OCCLUSION_WIDTH * SCREEN_OCCLUSION_HEIGHT;
-const SCREEN_OCCLUSION_DEPTH_BIAS: f32 = CHUNK_SIZE as f32 * 0.5;
-
-impl Default for ScreenOcclusionBuffer {
-    fn default() -> Self {
-        Self {
-            depths: [f32::INFINITY; SCREEN_OCCLUSION_CELL_COUNT],
-        }
-    }
-}
-
-impl ScreenOcclusionBuffer {
-    fn is_occluded(&self, rect: ScreenRect, depth: f32) -> bool {
-        let Some(rect) = rect.inset(0.003) else {
-            return false;
-        };
-        let Some((x_range, y_range)) = screen_rect_cell_ranges(rect) else {
-            return false;
-        };
-        let occlusion_depth = depth - SCREEN_OCCLUSION_DEPTH_BIAS;
-
-        for y in y_range.clone() {
-            for x in x_range.clone() {
-                if self.depths[x + y * SCREEN_OCCLUSION_WIDTH] > occlusion_depth {
-                    return false;
-                }
-            }
-        }
-
-        true
-    }
-
-    fn write(&mut self, rect: ScreenRect, depth: f32) {
-        let Some(rect) = rect.inset(0.01) else {
-            return;
-        };
-        let Some((x_range, y_range)) = screen_rect_cell_ranges(rect) else {
-            return;
-        };
-
-        for y in y_range {
-            for x in x_range.clone() {
-                let index = x + y * SCREEN_OCCLUSION_WIDTH;
-                self.depths[index] = self.depths[index].min(depth);
-            }
-        }
-    }
-}
-
-fn screen_rect_cell_ranges(
-    rect: ScreenRect,
-) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    let min_x = (rect.min_x.clamp(0.0, 1.0) * SCREEN_OCCLUSION_WIDTH as f32).floor() as usize;
-    let min_y = (rect.min_y.clamp(0.0, 1.0) * SCREEN_OCCLUSION_HEIGHT as f32).floor() as usize;
-    let max_x = (rect.max_x.clamp(0.0, 1.0) * SCREEN_OCCLUSION_WIDTH as f32).ceil() as usize;
-    let max_y = (rect.max_y.clamp(0.0, 1.0) * SCREEN_OCCLUSION_HEIGHT as f32).ceil() as usize;
-    let max_x = max_x.min(SCREEN_OCCLUSION_WIDTH);
-    let max_y = max_y.min(SCREEN_OCCLUSION_HEIGHT);
-
-    (max_x > min_x && max_y > min_y).then_some((min_x..max_x, min_y..max_y))
-}
-
-fn project_aabb_to_screen_rect(view_projection: Mat4, bounds: Aabb) -> Option<ScreenRect> {
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-
-    for corner in aabb_corners(bounds) {
-        let clip = view_projection * Vec3::from_array(corner).extend(1.0);
-
-        if clip.w <= 0.0 {
-            return None;
-        }
-
-        let ndc = clip.truncate() / clip.w;
-        min_x = min_x.min(ndc.x);
-        min_y = min_y.min(ndc.y);
-        max_x = max_x.max(ndc.x);
-        max_y = max_y.max(ndc.y);
-    }
-
-    if max_x < -1.0 || min_x > 1.0 || max_y < -1.0 || min_y > 1.0 {
-        return None;
-    }
-
-    Some(ScreenRect {
-        min_x: (min_x.max(-1.0) + 1.0) * 0.5,
-        min_y: (1.0 - max_y.min(1.0)) * 0.5,
-        max_x: (max_x.min(1.0) + 1.0) * 0.5,
-        max_y: (1.0 - min_y.max(-1.0)) * 0.5,
-    })
+    dx * dx + dy * dy + dz * dz
 }
 
 fn aabb_corners(bounds: Aabb) -> [[f32; 3]; 8] {
@@ -2449,25 +2338,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_occlusion_buffer_culls_covered_far_rects() {
-        let rect = ScreenRect {
-            min_x: 0.3,
-            min_y: 0.3,
-            max_x: 0.7,
-            max_y: 0.7,
-        };
-        let mut occlusion = ScreenOcclusionBuffer::default();
-
-        assert!(!occlusion.is_occluded(rect, 128.0));
-
-        occlusion.write(rect, 32.0);
-
-        assert!(occlusion.is_occluded(rect, 128.0));
-        assert!(!occlusion.is_occluded(rect, 40.0));
-    }
-
-    #[test]
-    fn visible_mesh_indices_skip_chunks_covered_by_nearer_chunks() {
+    fn visible_mesh_indices_keep_near_chunks_before_far_chunks() {
         let mut camera = VoxelCamera::new([0.0, 16.0, 16.0], 0.0, 0.0);
         camera.fov_y_radians = 90.0_f32.to_radians();
         camera.far = 256.0;
@@ -2478,8 +2349,8 @@ mod tests {
 
         let visible = visible_mesh_indices(camera, 16.0 / 9.0, true, &meshes);
 
-        assert!(visible.contains(&0));
-        assert!(!visible.contains(&1));
+        assert_eq!(visible.first().copied(), Some(0));
+        assert!(visible.contains(&1));
     }
 
     #[test]

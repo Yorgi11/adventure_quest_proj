@@ -1282,7 +1282,7 @@ impl AdventureQuestApp {
                 continue;
             }
 
-            if !chunk_is_visible_render_candidate(world, visibility, center, coord, settings) {
+            if !chunk_should_have_render_mesh(world, visibility, center, coord, settings) {
                 self.dirty_mesh_queue.enqueue(coord);
                 break;
             }
@@ -1334,7 +1334,7 @@ impl AdventureQuestApp {
             let Some(world) = self.world.as_ref() else {
                 break;
             };
-            let Some(coord) = self.streaming.pop_missing_visible(world, self.camera) else {
+            let Some(coord) = self.streaming.pop_missing(world) else {
                 break;
             };
 
@@ -1454,7 +1454,7 @@ impl AdventureQuestApp {
                 .copied()
                 .filter(|coord| !rendered_lookup.contains(coord))
                 .filter(|coord| {
-                    chunk_is_visible_render_candidate(world, visibility, center, *coord, settings)
+                    chunk_should_have_render_mesh(world, visibility, center, *coord, settings)
                 })
                 .collect();
 
@@ -1540,12 +1540,20 @@ fn streaming_chunk_coords(
     camera: VoxelCamera,
     viewport: PhysicalSize<u32>,
 ) -> VecDeque<ChunkCoord> {
-    let radius = settings.render_radius.max(0);
+    let radius = effective_streaming_radius(center, settings);
     let mut coords = Vec::with_capacity(config::MAX_STREAMING_COORDS_PER_CENTER.min(4096));
     let mut seen = HashSet::new();
 
     push_near_streaming_coords(center, radius, &mut seen, &mut coords);
-    push_visible_ray_streaming_coords(center, settings, camera, viewport, &mut seen, &mut coords);
+    push_visible_ray_streaming_coords(
+        center,
+        radius,
+        settings,
+        camera,
+        viewport,
+        &mut seen,
+        &mut coords,
+    );
 
     if coords.len() > config::MAX_STREAMING_COORDS_PER_CENTER {
         coords.select_nth_unstable_by_key(config::MAX_STREAMING_COORDS_PER_CENTER, |coord| {
@@ -1556,6 +1564,16 @@ fn streaming_chunk_coords(
 
     coords.sort_by_cached_key(|coord| chunk_streaming_priority_key(camera, center, *coord));
     coords.into()
+}
+
+fn effective_streaming_radius(center: ChunkCoord, settings: WorldStreamingSettings) -> i32 {
+    let radius = settings.render_radius.max(0);
+
+    if center.y < 0 {
+        radius.min(config::UNDERGROUND_STREAMING_CHUNK_RADIUS)
+    } else {
+        radius
+    }
 }
 
 fn streaming_view_key(
@@ -1598,13 +1616,14 @@ fn push_near_streaming_coords(
 
 fn push_visible_ray_streaming_coords(
     center: ChunkCoord,
+    render_radius: i32,
     settings: WorldStreamingSettings,
     camera: VoxelCamera,
     viewport: PhysicalSize<u32>,
     seen: &mut HashSet<ChunkCoord>,
     coords: &mut Vec<ChunkCoord>,
 ) {
-    let radius = settings.render_radius.max(0);
+    let radius = render_radius.max(0);
     let width = config::STREAMING_RAY_GRID_COLUMNS.max(1);
     let height = config::STREAMING_RAY_GRID_ROWS.max(1);
     let min_visible_y = visible_ray_min_chunk_y(center);
@@ -1645,7 +1664,7 @@ fn push_visible_ray_streaming_coords(
                     break;
                 }
 
-                if chunk_within_render_distance(center, coord, settings) {
+                if chunk_within_radius(center, coord, radius.min(settings.render_radius.max(0))) {
                     push_streaming_coord(coord, seen, coords);
                 }
             }
@@ -1722,8 +1741,10 @@ fn chunk_within_render_distance(
     coord: ChunkCoord,
     settings: WorldStreamingSettings,
 ) -> bool {
-    let radius = settings.render_radius.max(0);
+    chunk_within_radius(center, coord, settings.render_radius.max(0))
+}
 
+fn chunk_within_radius(center: ChunkCoord, coord: ChunkCoord, radius: i32) -> bool {
     chunk_distance_key(center, coord) <= radius * radius
 }
 
@@ -1746,6 +1767,23 @@ fn chunk_is_visible_render_candidate(
     chunk_is_render_candidate(world, center, coord, settings) && visibility.contains(coord)
 }
 
+fn chunk_should_have_render_mesh(
+    world: &VoxelWorld,
+    visibility: ChunkVisibility,
+    center: ChunkCoord,
+    coord: ChunkCoord,
+    settings: WorldStreamingSettings,
+) -> bool {
+    chunk_is_render_candidate(world, center, coord, settings)
+        && (chunk_is_near_priority(center, coord) || visibility.contains(coord))
+}
+
+fn chunk_is_near_priority(center: ChunkCoord, coord: ChunkCoord) -> bool {
+    let radius = config::STREAMING_NEAR_CHUNK_RADIUS.max(1);
+
+    chunk_distance_key(center, coord) <= radius * radius
+}
+
 fn chunk_render_priority_key(
     world: &VoxelWorld,
     camera: VoxelCamera,
@@ -1753,7 +1791,7 @@ fn chunk_render_priority_key(
     center: ChunkCoord,
     coord: ChunkCoord,
     settings: WorldStreamingSettings,
-) -> (u8, i32, i32, i32, i32, i32) {
+) -> (u8, u8, i32, i32, i32, i32, i32) {
     let visibility_rank =
         if chunk_is_visible_render_candidate(world, visibility, center, coord, settings) {
             0
@@ -1764,9 +1802,10 @@ fn chunk_render_priority_key(
         };
 
     (
+        (!chunk_is_near_priority(center, coord)) as u8,
         visibility_rank,
-        chunk_camera_depth_key(camera, coord),
         chunk_distance_key(center, coord),
+        chunk_camera_depth_key(camera, coord),
         coord.y,
         coord.z,
         coord.x,
@@ -1777,11 +1816,12 @@ fn chunk_streaming_priority_key(
     camera: VoxelCamera,
     center: ChunkCoord,
     coord: ChunkCoord,
-) -> (u8, i32, i32, i32, i32, i32) {
+) -> (u8, u8, i32, i32, i32, i32, i32) {
     (
+        (!chunk_is_near_priority(center, coord)) as u8,
         (camera.chunk_depth(coord) < -(CHUNK_SIZE as f32)) as u8,
-        chunk_camera_depth_key(camera, coord),
         chunk_distance_key(center, coord),
+        chunk_camera_depth_key(camera, coord),
         coord.y,
         coord.z,
         coord.x,
@@ -1796,69 +1836,6 @@ fn chunk_camera_depth_key(camera: VoxelCamera, coord: ChunkCoord) -> i32 {
     }
 
     (depth.max(0.0) * 16.0).round() as i32
-}
-
-fn streaming_coord_occluded_by_loaded_world(
-    world: &VoxelWorld,
-    camera: VoxelCamera,
-    target: ChunkCoord,
-) -> bool {
-    let center = camera_chunk_coord(camera);
-    let near_radius_sq = config::STREAMING_NEAR_CHUNK_RADIUS * config::STREAMING_NEAR_CHUNK_RADIUS;
-
-    if chunk_distance_key(center, target) <= near_radius_sq {
-        return false;
-    }
-
-    let target_center = chunk_world_center(target);
-    let to_target = [
-        target_center[0] - camera.position[0],
-        target_center[1] - camera.position[1],
-        target_center[2] - camera.position[2],
-    ];
-    let distance = dot3(to_target, to_target).sqrt();
-
-    if distance <= CHUNK_SIZE as f32 * 2.0 {
-        return false;
-    }
-
-    let direction = normalize3(to_target);
-    let steps = (distance / (CHUNK_SIZE as f32 * 0.5)).ceil().max(1.0) as i32;
-    let mut last_coord = None;
-
-    for step in 1..steps {
-        let sample_distance = step as f32 / steps as f32 * distance;
-        let position = add3(camera.position, mul3(direction, sample_distance));
-        let coord = world_to_chunk_coord(
-            position[0].floor() as i32,
-            position[1].floor() as i32,
-            position[2].floor() as i32,
-        );
-
-        if coord == center || coord == target || last_coord == Some(coord) {
-            continue;
-        }
-
-        last_coord = Some(coord);
-
-        if world.get_chunk(coord).is_some_and(|chunk| {
-            !chunk.is_empty() && chunk_has_sky_exposed_surface(world, coord, chunk)
-        }) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn chunk_world_center(coord: ChunkCoord) -> [f32; 3] {
-    let size = CHUNK_SIZE as f32;
-
-    [
-        coord.x as f32 * size + size * 0.5,
-        coord.y as f32 * size + size * 0.5,
-        coord.z as f32 * size + size * 0.5,
-    ]
 }
 
 fn chunk_is_render_skin(world: &VoxelWorld, coord: ChunkCoord) -> bool {
@@ -3195,32 +3172,11 @@ impl ChunkStreamingState {
         true
     }
 
-    #[cfg(test)]
     fn pop_missing(&mut self, world: &VoxelWorld) -> Option<ChunkCoord> {
         while let Some(coord) = self.pending_loads.pop_front() {
             if world.get_chunk(coord).is_none() {
                 return Some(coord);
             }
-        }
-
-        None
-    }
-
-    fn pop_missing_visible(
-        &mut self,
-        world: &VoxelWorld,
-        camera: VoxelCamera,
-    ) -> Option<ChunkCoord> {
-        while let Some(coord) = self.pending_loads.pop_front() {
-            if world.get_chunk(coord).is_some() {
-                continue;
-            }
-
-            if streaming_coord_occluded_by_loaded_world(world, camera, coord) {
-                continue;
-            }
-
-            return Some(coord);
         }
 
         None
@@ -3389,7 +3345,7 @@ impl WorldLoadState {
             .iter()
             .copied()
             .filter(|coord| {
-                chunk_is_visible_render_candidate(&self.world, visibility, center, *coord, settings)
+                chunk_should_have_render_mesh(&self.world, visibility, center, *coord, settings)
             })
             .collect();
 
@@ -4004,7 +3960,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_chunk_coords_prioritize_front_to_back_depth() {
+    fn streaming_chunk_coords_prioritize_near_chunks_before_far_chunks() {
         let center = ChunkCoord::new(0, 0, 0);
         let settings = WorldStreamingSettings::new(12, 12, 12, 12, 12, 13);
         let camera = VoxelCamera::new([16.0, 16.0, 16.0], 0.0, 0.0);
@@ -4024,6 +3980,21 @@ mod tests {
     }
 
     #[test]
+    fn underground_streaming_radius_is_capped() {
+        let center = ChunkCoord::new(0, -4, 0);
+        let settings = WorldStreamingSettings::new(99, 99, 99, 99, 99, 100);
+        let camera = VoxelCamera::new([16.0, -112.0, 16.0], 0.0, 0.0);
+        let coords = streaming_chunk_coords(center, settings, camera, PhysicalSize::new(1280, 720));
+
+        assert!(coords.contains(&center.offset(config::UNDERGROUND_STREAMING_CHUNK_RADIUS, 0, 0)));
+        assert!(!coords.contains(&center.offset(
+            config::UNDERGROUND_STREAMING_CHUNK_RADIUS + 1,
+            0,
+            0
+        )));
+    }
+
+    #[test]
     fn visible_ray_streaming_does_not_walk_into_deep_underground_chunks() {
         let center = ChunkCoord::new(0, 1, 0);
         let settings = WorldStreamingSettings::new(32, 32, 32, 32, 32, 33);
@@ -4037,25 +4008,6 @@ mod tests {
         assert!(!coords
             .iter()
             .any(|coord| coord.y < 0 && chunk_distance_key(center, *coord) > near_radius_sq));
-    }
-
-    #[test]
-    fn streaming_skips_far_chunks_hidden_behind_loaded_surface_chunks() {
-        let blocker = ChunkCoord::new(1, 0, 0);
-        let target = ChunkCoord::new(4, 0, 0);
-        let mut world = world_with_empty_chunks([blocker]);
-        let camera = VoxelCamera::new([16.0, 16.0, 16.0], 0.0, 0.0);
-
-        world.set_block(BlockPos::new(32, 0, 0), STONE_BLOCK);
-
-        assert!(streaming_coord_occluded_by_loaded_world(
-            &world, camera, target
-        ));
-        assert!(!streaming_coord_occluded_by_loaded_world(
-            &world,
-            camera,
-            ChunkCoord::new(2, 0, 0)
-        ));
     }
 
     #[test]
